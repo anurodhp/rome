@@ -52,6 +52,11 @@ void rome_term_free(RomeTerm *t);
  * pty. Returns the master fd (non-blocking) or -1. */
 int rome_term_spawn(RomeTerm *t, char *const argv[]);
 pid_t rome_term_pid(RomeTerm *t);
+/* Collect the child after it exited (blocking, brief): returns 1 and its wait status the first
+ * time, 0 after; the terminal then no longer signals the pid when it is freed. */
+int rome_term_reap(RomeTerm *t, int *status);
+/* Collect children of terminals closed while they were still dying. Call now and then. */
+void rome_term_reap_orphans(void);
 int rome_term_fd(RomeTerm *t);
 
 /* Read what the pty has (up to `budget` bytes) into the emulator. Returns

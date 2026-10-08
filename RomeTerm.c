@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <termios.h>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -69,11 +71,15 @@ struct RomeTerm {
 	/* selection: the press that started it, in screen rows (stable under scrolling) */
 	int sel_clicks;
 	int anchor_x;
-	unsigned long long anchor_y;
 	int held_button;
 
 	char *out;
-	size_t out_len, out_cap;
+	size_t out_len, out_cap, out_off;       /* out_off: already written */
+	int reaped;
+	uint32_t last_fg, last_bg, cur_color;   /* colours as of the last frame */
+	int colors_known;
+	int menc_dirty, menc_mode;
+	GhosttyTrackedGridRef anchor;           /* where the selection began, follows the text */
 };
 
 /* ---- helpers ---- */
@@ -150,13 +156,20 @@ cb_output(const char *s, size_t len, void *user)
 	RomeTerm *t = user;
 	if (t->out_len + len > t->out_cap) {
 		size_t cap = t->out_cap ? t->out_cap : 4096;
+		if (t->out_off > 0) {                   /* reclaim what was written */
+			memmove(t->out, t->out + t->out_off, t->out_len - t->out_off);
+			t->out_len -= t->out_off;
+			t->out_off = 0;
+		}
 		while (cap < t->out_len + len)
 			cap *= 2;
-		char *n = realloc(t->out, cap);
-		if (n == NULL)
-			return;
-		t->out = n;
-		t->out_cap = cap;
+		if (cap > t->out_cap) {
+			char *n = realloc(t->out, cap);
+			if (n == NULL)
+				return;
+			t->out = n;
+			t->out_cap = cap;
+		}
 	}
 	memcpy(t->out + t->out_len, s, len);
 	t->out_len += len;
@@ -165,19 +178,20 @@ cb_output(const char *s, size_t len, void *user)
 int
 rome_term_write_pending(RomeTerm *t)
 {
-	while (t->out_len > 0 && t->fd >= 0) {
-		ssize_t n = write(t->fd, t->out, t->out_len);
+	while (t->out_len > t->out_off && t->fd >= 0) {
+		ssize_t n = write(t->fd, t->out + t->out_off, t->out_len - t->out_off);
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
 			if (errno == EAGAIN)
 				return 1;
-			t->out_len = 0;     /* the child is gone */
+			t->out_len = t->out_off = 0;        /* the child is gone */
 			return 0;
 		}
-		memmove(t->out, t->out + n, t->out_len - n);
-		t->out_len -= n;
+		t->out_off += (size_t)n;
 	}
+	if (t->out_off >= t->out_len)
+		t->out_len = t->out_off = 0;
 	return 0;
 }
 
@@ -193,7 +207,12 @@ send_output(RomeTerm *t)
 static void
 fx_write_pty(GhosttyTerminal gt, void *ud, const uint8_t *data, size_t len)
 {
+	RomeTerm *t = ud;
 	(void)gt;
+	/* A program that never reads its input must not make the replies to its own
+	 * queries pile up without bound. Typed input and pastes are not capped. */
+	if (t->out_len - t->out_off > 65536)
+		return;
 	cb_output((const char *)data, len, ud);
 }
 
@@ -201,7 +220,16 @@ static void
 fx_bell(GhosttyTerminal gt, void *ud)
 {
 	RomeTerm *t = ud;
+	static double last;
+	struct timespec ts;
+	double now;
 	(void)gt;
+	/* one beep per 100 ms: a file full of BELs would otherwise beep 100000 times */
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	now = ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+	if (now - last < 100)
+		return;
+	last = now;
 	if (t->cb.bell != NULL)
 		t->cb.bell(t->owner);
 }
@@ -261,8 +289,12 @@ rome_term_new(int rows, int cols, int scrollback, const RomeTheme *theme, const 
 		return NULL;
 	if (rows < 2) rows = 2;
 	if (cols < 2) cols = 2;
+	if (rows > 1000) rows = 1000;           /* libghostty takes 16-bit sizes; nothing needs more */
+	if (cols > 1000) cols = 1000;
 	t->rows = rows;
 	t->cols = cols;
+	t->cur_color = theme->cursor;
+	t->menc_dirty = 1;
 	t->cell_w = 8;
 	t->cell_h = 16;
 	t->fd = -1;
@@ -312,6 +344,47 @@ rome_term_new(int rows, int cols, int scrollback, const RomeTheme *theme, const 
 	return t;
 }
 
+/* Children whose terminal was closed while they were still running: SIGHUP was sent, they
+ * are collected by rome_term_reap_orphans() once they have gone. */
+static pid_t orphans[64];
+static int norphans;
+
+static void
+orphan_add(pid_t pid)
+{
+	if (norphans == 64)
+		rome_term_reap_orphans();
+	if (norphans < 64)
+		orphans[norphans++] = pid;
+}
+
+void
+rome_term_reap_orphans(void)
+{
+	for (int i = 0; i < norphans; ) {
+		int st;
+		pid_t r = waitpid(orphans[i], &st, WNOHANG);
+		if (r == orphans[i] || (r < 0 && errno == ECHILD))
+			orphans[i] = orphans[--norphans];
+		else
+			i++;
+	}
+}
+
+int
+rome_term_reap(RomeTerm *t, int *status)
+{
+	int st = 0;
+	if (t->pid <= 0 || t->reaped)
+		return 0;
+	if (waitpid(t->pid, &st, 0) < 0)
+		st = 0;
+	t->reaped = 1;
+	if (status != NULL)
+		*status = st;
+	return 1;
+}
+
 void
 rome_term_free(RomeTerm *t)
 {
@@ -319,8 +392,13 @@ rome_term_free(RomeTerm *t)
 		return;
 	if (t->fd >= 0)
 		close(t->fd);
-	if (t->pid > 0)
+	if (t->pid > 0 && !t->reaped) {
+		int st;
 		kill(t->pid, SIGHUP);
+		if (waitpid(t->pid, &st, WNOHANG) == 0)
+			orphan_add(t->pid);     /* still dying: reaped later, no zombie */
+	}
+	if (t->anchor) ghostty_tracked_grid_ref_free(t->anchor);
 	if (t->mev) ghostty_mouse_event_free(t->mev);
 	if (t->menc) ghostty_mouse_encoder_free(t->menc);
 	if (t->kev) ghostty_key_event_free(t->kev);
@@ -350,10 +428,20 @@ rome_term_spawn(RomeTerm *t, char *const argv[])
 		setenv("TERM_PROGRAM", "rome", 1);
 		unsetenv("LINES");
 		unsetenv("COLUMNS");
-		signal(SIGCHLD, SIG_DFL);
-		signal(SIGPIPE, SIG_DFL);
+		/* the shell starts with default signal handling and an empty mask, whatever Rome
+		 * inherited (launched from `&`, SIGINT is ignored) */
+		{
+			static const int sigs[] = { SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGCHLD, SIGPIPE, SIGALRM,
+			    SIGTSTP, SIGTTIN, SIGTTOU };
+			sigset_t none;
+			sigemptyset(&none);
+			sigprocmask(SIG_SETMASK, &none, NULL);
+			for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
+				signal(sigs[i], SIG_DFL);
+		}
 		if (argv != NULL && argv[0] != NULL) {
 			execvp(argv[0], argv);
+			(void)!write(2, "rome: cannot execute the command\r\n", 34);
 			_exit(127);
 		}
 		struct passwd *pw = getpwuid(getuid());
@@ -376,6 +464,7 @@ rome_term_spawn(RomeTerm *t, char *const argv[])
 		char arg0[256];
 		snprintf(arg0, sizeof(arg0), "-%s", base);
 		execl(shell, arg0, (char *)NULL);
+		(void)!write(2, "rome: cannot execute the shell\r\n", 32);
 		_exit(127);
 	}
 	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
@@ -506,12 +595,99 @@ put_utf8(char *o, uint32_t c)
 	o[2] = (char)(0x80 | ((c >> 6) & 0x3f)); o[3] = (char)(0x80 | (c & 0x3f)); return 4;
 }
 
+/* The physical key of an ASCII character on a US layout, and whether Shift is what makes it. */
+static GhosttyKey
+ascii_key(uint32_t c, int *shifted, uint32_t *base)
+{
+	static const char *shift_syms = "!@#$%^&*()_+{}|:\"<>?~";
+	static const char *base_syms  = "1234567890-=[]\\;',./`";
+	*shifted = 0;
+	*base = c;
+	if (c >= 'A' && c <= 'Z') {
+		*shifted = 1;
+		*base = c + ('a' - 'A');
+		return (GhosttyKey)(GHOSTTY_KEY_A + (c - 'A'));
+	}
+	if (c >= 'a' && c <= 'z')
+		return (GhosttyKey)(GHOSTTY_KEY_A + (c - 'a'));
+	if (c >= '0' && c <= '9')
+		return (GhosttyKey)(GHOSTTY_KEY_DIGIT_0 + (c - '0'));
+	if (c < 128 && c != 0 && strchr(shift_syms, (int)c) != NULL) {
+		static const char pairs[][2] = { {'!','1'},{'@','2'},{'#','3'},{'$','4'},{'%','5'},{'^','6'},{'&','7'},{'*','8'},
+		    {'(','9'},{')','0'},{'_','-'},{'+','='},{'{','['},{'}',']'},{'|','\\'},{':',';'},{'"','\''},{'<',','},
+		    {'>','.'},{'?','/'},{'~','`'} };
+		for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+			if ((uint32_t)pairs[i][0] == c) {
+				uint32_t b2 = (unsigned char)pairs[i][1];
+				int s2;
+				uint32_t b3;
+				*shifted = 1;
+				*base = b2;
+				return ascii_key(b2, &s2, &b3);
+			}
+		}
+	}
+	(void)base_syms;
+	switch (c) {
+	case ' ': return GHOSTTY_KEY_SPACE;
+	case '-': return GHOSTTY_KEY_MINUS;
+	case '=': return GHOSTTY_KEY_EQUAL;
+	case '[': return GHOSTTY_KEY_BRACKET_LEFT;
+	case ']': return GHOSTTY_KEY_BRACKET_RIGHT;
+	case '\\': return GHOSTTY_KEY_BACKSLASH;
+	case ';': return GHOSTTY_KEY_SEMICOLON;
+	case '\'': return GHOSTTY_KEY_QUOTE;
+	case ',': return GHOSTTY_KEY_COMMA;
+	case '.': return GHOSTTY_KEY_PERIOD;
+	case '/': return GHOSTTY_KEY_SLASH;
+	case '`': return GHOSTTY_KEY_BACKQUOTE;
+	}
+	return GHOSTTY_KEY_UNIDENTIFIED;
+}
+
+/* With the Kitty keyboard protocol on (or modifyOtherKeys), a character key is reported as a key
+ * event, not as the raw bytes. Returns 1 if the encoder produced the bytes. */
+static int
+key_char_via_encoder(RomeTerm *t, uint32_t c, int mods)
+{
+	uint8_t flags = 0;
+	char out[64], text[8];
+	size_t n = 0, tn = 0;
+	int shifted;
+	uint32_t base;
+	GhosttyKey k;
+	ghostty_terminal_get(t->gt, GHOSTTY_TERMINAL_DATA_KITTY_KEYBOARD_FLAGS, &flags);
+	if (flags == 0 || c >= 0xd800)
+		return 0;
+	k = ascii_key(c, &shifted, &base);
+	ghostty_key_encoder_setopt_from_terminal(t->kenc, t->gt);
+	ghostty_key_event_set_action(t->kev, GHOSTTY_KEY_ACTION_PRESS);
+	ghostty_key_event_set_key(t->kev, k);
+	ghostty_key_event_set_mods(t->kev, ghostty_mods(mods | (shifted ? ROME_MOD_SHIFT : 0)));
+	ghostty_key_event_set_consumed_mods(t->kev, shifted ? GHOSTTY_MODS_SHIFT : 0);
+	ghostty_key_event_set_composing(t->kev, false);
+	ghostty_key_event_set_unshifted_codepoint(t->kev, k == GHOSTTY_KEY_UNIDENTIFIED ? c : base);
+	/* the text the key produces: none while Control is held */
+	if (!(mods & ROME_MOD_CTRL))
+		tn = put_utf8(text, c);
+	ghostty_key_event_set_utf8(t->kev, tn ? text : NULL, tn);
+	if (ghostty_key_encoder_encode(t->kenc, t->kev, out, sizeof(out), &n) != GHOSTTY_SUCCESS || n == 0)
+		return 0;
+	cb_output(out, n, t);
+	send_output(t);
+	return 1;
+}
+
 void
 rome_term_key_char(RomeTerm *t, uint32_t c, int mods)
 {
 	char b[8];
 	size_t n = 0;
+	if ((c >= 0xd800 && c < 0xe000) || c > 0x10ffff)
+		return;         /* not a character */
 	rome_term_scroll_to_bottom(t);
+	if (key_char_via_encoder(t, c, mods))
+		return;
 	/* Control characters are sent as bytes (Ctrl-C is 0x03), with an ESC in
 	 * front for Alt. */
 	if (mods & ROME_MOD_CTRL) {
@@ -531,7 +707,7 @@ rome_term_key_char(RomeTerm *t, uint32_t c, int mods)
 			code = 29;
 		else if (k == '^' || k == '6')
 			code = 30;
-		else if (k == '_' || k == '-' || k == '7')
+		else if (k == '_' || k == '-' || k == '/' || k == '7')
 			code = 31;
 		else if (k == '?' || k == '8')
 			code = 127;
@@ -652,8 +828,24 @@ rome_term_mouse(RomeTerm *t, int row, int col, int button, int pressed, int mods
 		.screen_width = (uint32_t)(t->cols * t->cell_w), .screen_height = (uint32_t)(t->rows * t->cell_h),
 		.cell_width = (uint32_t)t->cell_w, .cell_height = (uint32_t)t->cell_h,
 	};
-	ghostty_mouse_encoder_setopt_from_terminal(t->menc, t->gt);
-	ghostty_mouse_encoder_setopt(t->menc, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &sz);
+	/* Each of these clears the encoder's "last cell", which is what lets it drop motion that did not
+	 * change cell, so only reconfigure on a press or release, or when the application changed
+	 * its mouse mode. */
+	{
+		int mm = rome_term_mouse_mode(t);
+		if (button > 0 || mm != t->menc_mode || t->menc_dirty) {
+			bool track = true;
+			ghostty_mouse_encoder_setopt_from_terminal(t->menc, t->gt);
+			ghostty_mouse_encoder_setopt(t->menc, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &sz);
+			ghostty_mouse_encoder_setopt(t->menc, GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL, &track);
+			t->menc_mode = mm;
+			t->menc_dirty = 0;
+		}
+	}
+	{
+		bool held = t->held_button > 0 || (button > 0 && button <= 3 && pressed);
+		ghostty_mouse_encoder_setopt(t->menc, GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED, &held);
+	}
 	if (button > 0) {
 		ghostty_mouse_event_set_action(t->mev, pressed ? GHOSTTY_MOUSE_ACTION_PRESS : GHOSTTY_MOUSE_ACTION_RELEASE);
 		ghostty_mouse_event_set_button(t->mev, map_button(button));
@@ -680,6 +872,9 @@ rome_term_resize(RomeTerm *t, int rows, int cols, int xpix, int ypix)
 {
 	if (rows < 2) rows = 2;
 	if (cols < 2) cols = 2;
+	if (rows > 1000) rows = 1000;
+	if (cols > 1000) cols = 1000;
+	t->menc_dirty = 1;
 	if (xpix >= cols) t->cell_w = xpix / cols;
 	if (ypix >= rows) t->cell_h = ypix / rows;
 	t->full = 1;
@@ -720,13 +915,14 @@ viewport_ref(RomeTerm *t, int row, int col, GhosttyGridRef *ref)
 	return ghostty_terminal_grid_ref(t->gt, p, ref) == GHOSTTY_SUCCESS;
 }
 
+/* The press that began the selection, as a reference the terminal keeps pointing at the same
+ * text while output scrolls, scrollback is pruned and the screen reflows. */
 static int
 anchor_ref(RomeTerm *t, GhosttyGridRef *ref)
 {
-	GhosttyPoint p = { .tag = GHOSTTY_POINT_TAG_SCREEN,
-	    .value = { .coordinate = { .x = (uint16_t)t->anchor_x, .y = (uint32_t)t->anchor_y } } };
 	*ref = (GhosttyGridRef)GHOSTTY_INIT_SIZED(GhosttyGridRef);
-	return ghostty_terminal_grid_ref(t->gt, p, ref) == GHOSTTY_SUCCESS;
+	return t->anchor != NULL && ghostty_tracked_grid_ref_has_value(t->anchor) &&
+	    ghostty_tracked_grid_ref_snapshot(t->anchor, ref) == GHOSTTY_SUCCESS;
 }
 
 static void
@@ -760,7 +956,16 @@ rome_term_select_begin(RomeTerm *t, int row, int col, int clicks)
 	GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
 	t->sel_clicks = clicks < 1 ? 1 : clicks;
 	t->anchor_x = col;
-	t->anchor_y = (unsigned long long)row + (scrollbar(t, &sb) ? sb.offset : 0);
+	if (t->anchor != NULL) {
+		ghostty_tracked_grid_ref_free(t->anchor);
+		t->anchor = NULL;
+	}
+	{
+		GhosttyPoint p = { .tag = GHOSTTY_POINT_TAG_VIEWPORT,
+		    .value = { .coordinate = { .x = (uint16_t)col, .y = (uint32_t)row } } };
+		ghostty_terminal_grid_ref_track(t->gt, p, &t->anchor);
+	}
+	(void)sb;
 	if (t->sel_clicks == 1) {
 		rome_term_select_clear(t);
 		return;
@@ -772,11 +977,15 @@ rome_term_select_begin(RomeTerm *t, int row, int col, int clicks)
 		o.ref = ref;
 		if (ghostty_terminal_select_word(t->gt, &o, &sel) == GHOSTTY_SUCCESS)
 			set_selection(t, &sel);
+		else
+			rome_term_select_clear(t);      /* blank cells: nothing to select, not the old selection */
 	} else {
 		GhosttyTerminalSelectLineOptions o = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectLineOptions);
 		o.ref = ref;
 		if (ghostty_terminal_select_line(t->gt, &o, &sel) == GHOSTTY_SUCCESS)
 			set_selection(t, &sel);
+		else
+			rome_term_select_clear(t);
 	}
 }
 
@@ -784,10 +993,21 @@ void
 rome_term_select_extend(RomeTerm *t, int row, int col)
 {
 	GhosttyGridRef cur, anc;
-	GhosttyTerminalScrollbar sb;
+	GhosttyPointCoordinate ap = { 0, 0 }, cp = { 0, 0 };
 	GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+	int backward;
 	if (!viewport_ref(t, row, col, &cur) || !anchor_ref(t, &anc))
 		return;
+	/* is the pointer before the press? (both as rows from the top of the whole screen) */
+	GhosttyPoint cpt = { .tag = GHOSTTY_POINT_TAG_VIEWPORT, .value = { .coordinate = { .x = (uint16_t)col, .y = (uint32_t)row } } };
+	(void)cpt;
+	ghostty_tracked_grid_ref_point(t->anchor, GHOSTTY_POINT_TAG_SCREEN, &ap);
+	{
+		GhosttyTerminalScrollbar sb;
+		cp.y = (uint32_t)row + (scrollbar(t, &sb) ? (uint32_t)sb.offset : 0);
+		cp.x = (uint16_t)col;
+	}
+	backward = cp.y < ap.y || (cp.y == ap.y && cp.x < ap.x);
 	if (t->sel_clicks <= 1) {
 		sel.start = anc;
 		sel.end = cur;
@@ -806,8 +1026,13 @@ rome_term_select_extend(RomeTerm *t, int row, int col)
 		o.end = anc;
 		if (ghostty_terminal_select_word_between(t->gt, &o, &b) != GHOSTTY_SUCCESS)
 			return;
-		sel.start = a.start;
-		sel.end = b.end;
+		if (backward) {
+			sel.start = b.start;
+			sel.end = a.end;
+		} else {
+			sel.start = a.start;
+			sel.end = b.end;
+		}
 		set_selection(t, &sel);
 		return;
 	}
@@ -819,8 +1044,7 @@ rome_term_select_extend(RomeTerm *t, int row, int col)
 	lo.ref = cur;
 	if (ghostty_terminal_select_line(t->gt, &lo, &lc) != GHOSTTY_SUCCESS)
 		return;
-	unsigned long long cy = (unsigned long long)row + (scrollbar(t, &sb) ? sb.offset : 0);
-	if (cy < t->anchor_y) {
+	if (backward) {
 		sel.start = la.end;
 		sel.end = lc.start;
 	} else {
@@ -846,6 +1070,7 @@ rome_term_selection_text(RomeTerm *t)
 	size_t n = 0;
 	o.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
 	o.trim = true;
+	o.unwrap = true;        /* a soft-wrapped line is one line in the clipboard */
 	o.selection = NULL;     /* the terminal's own */
 	if (ghostty_terminal_selection_format_alloc(t->gt, NULL, o, &p, &n) != GHOSTTY_SUCCESS || p == NULL)
 		return NULL;
@@ -1000,13 +1225,13 @@ apply_cursor(RomeTerm *t, int kind)
 	switch (kind) {
 	case CUR_BLOCK:
 		c->fg = c->bg;
-		c->bg = t->theme.cursor;
+		c->bg = t->cur_color;
 		if (c->width == 2)
-			c[1].bg = t->theme.cursor;
+			c[1].bg = t->cur_color;
 		break;
-	case CUR_BOX: c->attrs |= ROME_ATTR_CUR_BOX; c->fg = t->theme.cursor; break;
-	case CUR_UNDER: c->attrs |= ROME_ATTR_CUR_UNDER; c->fg = t->theme.cursor; break;
-	case CUR_BAR: c->attrs |= ROME_ATTR_CUR_BAR; c->fg = t->theme.cursor; break;
+	case CUR_BOX: c->attrs |= ROME_ATTR_CUR_BOX; c->fg = t->cur_color; break;
+	case CUR_UNDER: c->attrs |= ROME_ATTR_CUR_UNDER; c->fg = t->cur_color; break;
+	case CUR_BAR: c->attrs |= ROME_ATTR_CUR_BAR; c->fg = t->cur_color; break;
 	}
 }
 
@@ -1029,6 +1254,19 @@ rome_term_render(RomeTerm *t, RomeRenderer *r)
 	t->r = r;
 	if (ghostty_render_state_update(t->rs, t->gt) != GHOSTTY_SUCCESS)
 		return 0;
+	{
+		/* The terminal can change its own size (DECCOLM, ESC[?3h): Rome's grid, the pty and the
+		 * window are the truth, so put it back. */
+		uint16_t rc = 0, rr = 0;
+		ghostty_render_state_get(t->rs, GHOSTTY_RENDER_STATE_DATA_COLS, &rc);
+		ghostty_render_state_get(t->rs, GHOSTTY_RENDER_STATE_DATA_ROWS, &rr);
+		if (rc != t->cols || rr != t->rows) {
+			ghostty_terminal_resize(t->gt, (uint16_t)t->cols, (uint16_t)t->rows, (uint32_t)t->cell_w, (uint32_t)t->cell_h);
+			if (ghostty_render_state_update(t->rs, t->gt) != GHOSTTY_SUCCESS)
+				return 0;
+			t->full = 1;
+		}
+	}
 	if (r->want_full_redraw) {
 		r->want_full_redraw = 0;
 		t->full = 1;
@@ -1039,6 +1277,20 @@ rome_term_render(RomeTerm *t, RomeRenderer *r)
 	if (dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL)
 		memset(t->want, 1, t->rows);
 	ghostty_render_state_get(t->rs, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors);
+	{
+		/* OSC 10/11/12 change the default colours without marking anything dirty: every cell
+		 * drawn with a default colour, and the margin, must be redrawn. */
+		uint32_t fg = pack(colors.foreground), bg = pack(colors.background);
+		uint32_t cc = colors.cursor_has_value ? pack(colors.cursor) : t->theme.cursor;
+		if (!t->colors_known || fg != t->last_fg || bg != t->last_bg || cc != t->cur_color) {
+			t->colors_known = 1;
+			t->last_fg = fg;
+			t->last_bg = bg;
+			t->cur_color = cc;
+			r->padbg = bg;
+			t->full = 1;
+		}
+	}
 	ghostty_render_state_get(t->rs, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cur);
 	t->cur_in_view = cur.viewport_has_value;
 	t->cur_x = cur.viewport_x;
@@ -1123,5 +1375,9 @@ rome_term_render(RomeTerm *t, RomeRenderer *r)
 	memset(t->want, 0, t->rows);
 	ghostty_render_state_clean(t->rs);
 	r->present(r, rects, nrects);
+	if (r->want_full_redraw) {      /* the renderer lost its image mid-frame (GL atlas reset): repair */
+		t->full = 1;
+		t->hint = 1;
+	}
 	return drawn;
 }

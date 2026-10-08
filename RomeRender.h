@@ -10,8 +10,8 @@
  * own X connection (RomeX.c), and keep the window's pixels in step with a
  * retained image of the whole grid (a client-side MIT-SHM image for the X11
  * renderer, the GL back buffer for the GL renderer). Each frame draws only
- * the cells that changed and puts only those pixels on the screen; a scroll
- * is an XCopyArea inside the X server.
+ * the cells that changed and puts only those pixels on the screen. (The
+ * scroll() entry, an XCopyArea inside the X server, is not used at present.)
  */
 #ifndef ROME_RENDER_H
 #define ROME_RENDER_H

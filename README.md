@@ -17,12 +17,13 @@ Measured on a Raspberry Pi 3 (Cortex-A53, 1 GB) against the GNUstep Terminal it 
 | CPU while idle (30 s at a prompt) | 0.06 s | 0.8–1.1 s |
 | Memory (resident) | 29 MB | 111–156 MB |
 
-That is about **55–60× faster** on output, with a fraction of the CPU and memory. Typing is immediate: with a key typed every 50 ms, the time from the keypress to the pixels on screen is **1.0 ms on average** (8.7 ms worst case), measured inside Rome.
+That is about **55–65× faster** on output, with a fraction of the CPU and memory. Typing is not paced by a timer: Rome draws the echo of a keypress as soon as it reads it (in its own benchmark, with a key sent every 50 ms, the next frame is drawn about 1 ms later; that is a measure of Rome's loop, not an end-to-end latency).
 
 How these were taken, and what they do not show:
 - Both terminals were launched from an ssh session, which on this system runs at background priority, so timers are slower than for programs started from the desktop. They were treated identically; absolute numbers for either should be better at desktop priority.
 - Output speed is bash's `time` around `seq` in each terminal's own shell; CPU is the process's CPU from `ps`.
-- I did not get a comparable key-to-pixel number for the old Terminal (the probe needs a clean run on a quiet machine), so the typing figure is Rome's alone. `tools/compare.sh` and `tools/xlatency.c` are the harness; rerun them to reproduce or to add that number.
+- I did not get a comparable key-to-pixel number for either terminal (the external probe needs a clean run on a quiet machine). `tools/compare.sh` and `tools/xlatency.c` are the harness; rerun them to reproduce, or to add that number.
+- Rome's side of the table is one run; the old Terminal's reproduced across two.
 
 ## Features
 
@@ -52,7 +53,7 @@ Set as GNUstep defaults or on the command line (`Rome -RomeFontSize 15`):
 | `RomeCommand` | run `/bin/sh -c <command>` instead of the login shell | |
 | `RomeImmediateRender` | draw small reads at once instead of waiting for the frame timer | YES |
 
-`ROME_STATS=1` prints frame costs, key-to-screen latency and run-loop stalls on exit.
+`ROME_STATS=1` prints frame costs, key-to-frame time and run-loop stalls (every 200 frames, and when the shell exits).
 
 ## Building
 
@@ -72,7 +73,7 @@ Then, from this directory:
 
 `deploy` uses `DEPLOY_HOST` (default `root@10.0.0.142`).
 
-To build on another system with GNUstep, libghostty-vt (`zig build -Demit-lib-vt=true`), FreeType, fontconfig, Xlib with MIT-SHM and libGL installed:
+Rome currently needs a Darwin-based system (it names the foreground process with `sysctl`/`kinfo_proc`, and `forkpty` comes from `<util.h>`), not Linux. On such a system with GNUstep, libghostty-vt (`zig build -Demit-lib-vt=true`), FreeType, fontconfig, Xlib with MIT-SHM and libGL installed:
 
 ```sh
 make ADDITIONAL_CPPFLAGS="-I/path/to/ghostty/include -I/usr/include/freetype2" \
@@ -81,7 +82,7 @@ make ADDITIONAL_CPPFLAGS="-I/path/to/ghostty/include -I/usr/include/freetype2" \
 
 ### Testing
 
-`tools/term_test.sh` builds libghostty-vt for the host and runs the terminal core (`RomeTerm.c`) against it with a stub renderer: escape sequences in, cells, scrollback, selection, and the bytes sent for keys, mouse, paste and queries out. It needs only Zig and a C compiler, no Pi.
+`tools/term_test.sh` builds libghostty-vt for the host and runs the terminal core (`RomeTerm.c`) against it with a stub renderer: escape sequences in, cells, scrollback, selection, and the bytes sent for keys, mouse, paste and queries out. It then runs `tools/term_regress.c`, assertion tests for bugs found in review (copy of wrapped lines, word-drag direction, size changes by the application, colour changes, the Kitty keyboard protocol, mouse de-duplication, reaping of closed tabs' shells). It needs only Zig and a C compiler, no Pi.
 
 ## Layout
 
@@ -91,6 +92,13 @@ make ADDITIONAL_CPPFLAGS="-I/path/to/ghostty/include -I/usr/include/freetype2" \
 | `RomeView.m`, `RomeTabs.m`, `main.m` | the AppKit side: window, tabs, scroll bar, input, menus |
 | `RomeRenderX11.c`, `RomeRenderGL.c`, `RomeFont.c`, `RomeX.c` | renderers, glyph atlas, the X connection |
 | `tools/` | tests and benchmarks: `term_test.sh`, `compare.sh`, `xlatency.c`, `pty_latency.c`, `wake_latency.c`, `sleep_latency.c`, `xwd2png.py` |
+
+## Known limitations
+
+- Combining characters and emoji sequences: only the first code point of a cell is drawn.
+- No image protocols (Sixel, Kitty graphics); the terminal ignores them.
+- Pasting without bracketed paste mode sends every line, as typing would.
+- Kitty keyboard protocol: key presses are reported, key releases are not.
 
 ## Licence
 

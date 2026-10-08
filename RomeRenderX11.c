@@ -5,9 +5,9 @@
  * window (an MIT-SHM segment when the server and the SysV limits allow it),
  * blending each glyph's atlas coverage between the cell's background and
  * foreground. Only the changed cells are drawn, and only their rectangles
- * are put on the window (XShmPutImage, else XPutImage). A scroll is an
- * XCopyArea of the window inside the X server plus a memmove of the image,
- * so scrolling output costs one new line, not a screenful.
+ * are put on the window (XShmPutImage, else XPutImage). The scroll() entry
+ * (XCopyArea inside the X server plus a memmove of the image) is currently
+ * unused: the core redraws the rows that differ.
  */
 #include "RomeRender.h"
 #include "RomeX.h"

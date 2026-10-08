@@ -24,7 +24,7 @@ SOFTWARE.
 Third-party components rome links against (dynamically; none is included in
 this repository):
 
-  libvterm                   MIT          (c) Paul Evans
+  libghostty-vt (Ghostty)    MIT          (c) Mitchell Hashimoto, Ghostty contributors
   GNUstep base/gui/back      LGPL-2.1+    (c) Free Software Foundation
   FreeType                   FTL or GPLv2 (c) The FreeType Project
   fontconfig                 MIT-style    (c) Keith Packard and others

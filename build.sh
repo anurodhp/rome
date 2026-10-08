@@ -21,6 +21,8 @@ GSROOT="$(cd "$STAGING/libc_build/gnustep/root/usr/GNUstep/System" && pwd -P)"
 # libghostty-vt: a dylib of its own, at its install name
 ssh "$HOST" 'cat > /usr/lib/libghostty-vt.0.dylib.new && mv /usr/lib/libghostty-vt.0.dylib.new /usr/lib/libghostty-vt.0.dylib' \
     < "$STAGING/libc_build/system/libghostty-vt.dylib"
+# unpacked beside the old app and swapped in, so a failed transfer leaves the old one
 tar -C "$GSROOT/Applications" -cf - Rome.app |
-    ssh "$HOST" 'rm -rf /Applications/Rome.app && tar -C /Applications -xf -'
+    ssh "$HOST" 'rm -rf /Applications/.Rome.new && mkdir /Applications/.Rome.new && tar -C /Applications/.Rome.new -xf - &&
+        rm -rf /Applications/Rome.app && mv /Applications/.Rome.new/Rome.app /Applications/Rome.app && rmdir /Applications/.Rome.new'
 echo "deployed Rome.app and libghostty-vt.dylib to $HOST"

@@ -73,7 +73,7 @@ rgb(unsigned c)
 		return;
 	NSUInteger i = (NSUInteger)(p.x / w);
 	if (i < n) {
-		if (p.x > (i + 1) * w - kCloseW)
+		if (w > 3 * kCloseW && p.x > (i + 1) * w - kCloseW)
 			[owner closeIndex: i];
 		else
 			[owner selectIndex: i];
@@ -143,6 +143,13 @@ rgb(unsigned c)
 }
 
 - (NSWindow *) window { return window; }
+
+/* The window is not retained: forget it as it closes, so a close still queued (a shell that
+ * exited) does not message a freed window. */
+- (void) windowWillClose: (NSNotification *)n
+{
+	window = nil;
+}
 - (RomeView *) selectedView { return selected; }
 - (NSUInteger) tabCount { return [tabs count]; }
 
@@ -167,8 +174,10 @@ rgb(unsigned c)
 	[bar setFrame: NSMakeRect(0, 0, b.size.width, kBarH)];
 	NSRect vf = NSMakeRect(0, bh, b.size.width, b.size.height - bh);
 	for (RomeView *v in tabs) {
-		if (!NSEqualRects([v frame], vf))
+		if (!NSEqualRects([v frame], vf)) {
 			[v setFrame: vf];
+			[v layoutGrid];     /* -setFrame: alone does not reach -setFrameSize: on this GNUstep */
+		}
 	}
 	[container setNeedsDisplay: YES];
 	[bar setNeedsDisplay: YES];

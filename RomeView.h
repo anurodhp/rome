@@ -25,6 +25,8 @@
 	BOOL immediateRender, renderScheduled, reading, writing, exited, optionAsMeta, blinkEnabled;
 	NSTimer *blinkTimer, *titleTimer, *probeTimer;
 	double probeLast, recentBytes, recentAt;
+	int blinkPhase, pressRow, pressCol;
+	BOOL selMoved;
 	NSString *oscTitle, *fgName, *shownTitle;
 	pid_t oscPgrp, fgPgrp;
 	int selClicks;
@@ -40,6 +42,7 @@
 + (NSSize) contentSizeForColumns: (int)cols rows: (int)rows;
 - (NSSize) cellSize;
 - (void) start;
+- (void) layoutGrid;
 - (id) controller;
 - (void) setController: (id)c;
 - (void) setTabVisible: (BOOL)visible;

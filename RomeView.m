@@ -73,6 +73,8 @@ open_font(void)
 {
 	NSString *fam = default_string(@"RomeFont", @"DejaVu Sans Mono");
 	double px = default_double(@"RomeFontSize", 13);
+	if (px < 4) px = 4;
+	if (px > 200) px = 200;
 	RomeFont *f = rome_font_new([fam UTF8String], px);
 	if (f == NULL)
 		f = rome_font_new("monospace", px);
@@ -181,6 +183,7 @@ want_write_cb(void *owner)
 	minFrameMs = fps > 0 ? 1000.0 / fps : 0;
 	optionAsMeta = default_bool(@"RomeOptionAsMeta", YES);
 	blinkEnabled = default_bool(@"RomeCursorBlink", YES);
+	blinkPhase = 1;
 	immediateRender = default_bool(@"RomeImmediateRender", YES);
 	rendererName = [default_string(@"RomeRenderer", @"x11") retain];
 	const RomeTheme *theme = theme_named(default_string(@"RomeTheme", @"Dark"));
@@ -397,6 +400,7 @@ want_write_cb(void *owner)
 	if (w == nil)
 		return;
 	NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+	[w setAcceptsMouseMovedEvents: YES];       /* for mouse mode 1003; mouseMoved: ignores it otherwise */
 	[nc addObserver: self selector: @selector(windowFocus:) name: NSWindowDidBecomeKeyNotification object: w];
 	[nc addObserver: self selector: @selector(windowFocus:) name: NSWindowDidResignKeyNotification object: w];
 	[nc addObserver: self selector: @selector(windowResized:) name: NSWindowDidResizeNotification object: w];
@@ -495,6 +499,7 @@ want_write_cb(void *owner)
 
 - (void) pollTitle: (NSTimer *)timer
 {
+	rome_term_reap_orphans();     /* shells of tabs closed while they were still exiting */
 	if (term == NULL || rome_term_fd(term) < 0)
 		return;
 	pid_t pg = tcgetpgrp(rome_term_fd(term));
@@ -650,11 +655,9 @@ want_write_cb(void *owner)
 - (void) childExited
 {
 	int status = 0;
-	pid_t pid = rome_term_pid(term);
 	[self stopReading];
 	exited = YES;
-	if (pid > 0)
-		waitpid(pid, &status, 0);
+	rome_term_reap(term, &status);
 	const char *msg = "\r\n[Process completed]";
 	rome_term_feed(term, msg, strlen(msg));
 	[self scheduleRender];
@@ -736,11 +739,10 @@ want_write_cb(void *owner)
 
 - (void) blink: (NSTimer *)t
 {
-	static int phase = 1;
 	if (term == NULL || !rome_term_cursor_blinks(term))
 		return;
-	phase = !phase;
-	rome_term_set_cursor_phase(term, phase);
+	blinkPhase = !blinkPhase;
+	rome_term_set_cursor_phase(term, blinkPhase);
 	[self scheduleRender];
 }
 
@@ -749,6 +751,7 @@ want_write_cb(void *owner)
 	if (term == NULL)
 		return;
 	rome_term_set_cursor_phase(term, 1);
+	blinkPhase = 1;
 	if (keyTimeMs == 0)
 		keyTimeMs = rome_now_ms();
 	/* restart the blink cycle so the cursor stays on while typing */
@@ -833,6 +836,8 @@ want_write_cb(void *owner)
 				i++;
 			}
 		}
+		if (u >= 0xd800 && u < 0xe000)
+			continue;       /* a lone surrogate is not text */
 		if (u >= 0xf700 && u <= 0xf8ff)
 			continue;       /* other function keys */
 		rome_term_key_char(term, u, mods);
@@ -895,6 +900,9 @@ want_write_cb(void *owner)
 	[self cellAt: ev row: &row col: &col clamp: YES];
 	selClicks = (int)[ev clickCount];
 	selecting = YES;
+	selMoved = NO;
+	pressRow = row;
+	pressCol = col;
 	rome_term_select_begin(term, row, col, selClicks);
 	[self scheduleRender];
 }
@@ -912,6 +920,10 @@ want_write_cb(void *owner)
 		return;
 	int row, col;
 	[self cellAt: ev row: &row col: &col clamp: YES];
+	/* a click with a little jitter is a click, not a one-character selection */
+	if (!selMoved && selClicks <= 1 && row == pressRow && col == pressCol)
+		return;
+	selMoved = YES;
 	rome_term_select_extend(term, row, col);
 	[self scheduleRender];
 }
@@ -936,6 +948,36 @@ want_write_cb(void *owner)
 		[super rightMouseDown: ev];
 }
 
+- (void) mouseMoved: (NSEvent *)ev
+{
+	if (term != NULL && rome_term_mouse_mode(term) == ROME_MOUSE_MOVE && [self reportMouse: ev])
+		[self mouseEvent: ev button: 0 pressed: 0];
+}
+
+- (void) rightMouseDragged: (NSEvent *)ev
+{
+	if (term != NULL && rome_term_mouse_mode(term) >= ROME_MOUSE_DRAG && [self reportMouse: ev])
+		[self mouseEvent: ev button: 0 pressed: 0];
+}
+
+- (void) otherMouseDown: (NSEvent *)ev
+{
+	if ([self reportMouse: ev])
+		[self mouseEvent: ev button: 2 pressed: 1];
+}
+
+- (void) otherMouseUp: (NSEvent *)ev
+{
+	if ([self reportMouse: ev])
+		[self mouseEvent: ev button: 2 pressed: 0];
+}
+
+- (void) otherMouseDragged: (NSEvent *)ev
+{
+	if (term != NULL && rome_term_mouse_mode(term) >= ROME_MOUSE_DRAG && [self reportMouse: ev])
+		[self mouseEvent: ev button: 0 pressed: 0];
+}
+
 - (void) rightMouseUp: (NSEvent *)ev
 {
 	if ([self reportMouse: ev])
@@ -947,6 +989,8 @@ want_write_cb(void *owner)
 	if (term == NULL)
 		return;
 	CGFloat dy = [ev deltaY];
+	if (dy == 0)
+		return;         /* a horizontal scroll */
 	int steps = dy > 0 ? (int)(dy + 0.5) : (int)(dy - 0.5);
 	if (steps == 0)
 		steps = dy > 0 ? 1 : -1;

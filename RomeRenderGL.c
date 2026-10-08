@@ -19,9 +19,9 @@
  * GPU (v3d_drm_read_bo of stride x height), which is the floor of a GL
  * frame's cost.
  *
- * A scroll is an XCopyArea of the window inside the X server (the window
- * shows exactly the back buffer after every present); the moved rows are
- * then redrawn into the back buffer on the GPU but not presented again.
+ * The scroll() entry (an XCopyArea inside the X server, the moved rows then
+ * redrawn into the back buffer but not presented) is currently unused: the
+ * core redraws the rows that differ.
  */
 #include "RomeRender.h"
 #include "RomeX.h"

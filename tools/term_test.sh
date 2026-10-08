@@ -15,4 +15,8 @@ B="$HERE/.build-test"
 mkdir -p "$B"
 [ -f "$B/lib/libghostty-vt.a" ] || (cd "$GH" && "$ZIG" build -Dsimd=false -Doptimize=ReleaseFast -Demit-lib-vt=true --prefix "$B")
 clang -std=gnu99 -g -Wall -I"$B/include" -I"$HERE" "$HERE/tools/term_test.c" "$B/lib/libghostty-vt.a" -o "$B/term_test"
+clang -std=gnu99 -g -Wall -I"$B/include" -I"$HERE" "$HERE/tools/term_regress.c" "$B/lib/libghostty-vt.a" -o "$B/term_regress"
+"$B/term_regress"
 "$B/term_test"
+clang -std=gnu99 -g -Wall -I"$B/include" -I"$HERE" "$HERE/tools/term_regress.c" "$B/lib/libghostty-vt.a" -o "$B/term_regress"
+"$B/term_regress"

@@ -109,6 +109,10 @@ add_item(NSMenu *m, NSString *title, SEL action, NSString *key)
 	NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 	int cols = [ud objectForKey: @"RomeColumns"] ? (int)[ud integerForKey: @"RomeColumns"] : 80;
 	int rows = [ud objectForKey: @"RomeRows"] ? (int)[ud integerForKey: @"RomeRows"] : 24;
+	if (cols < 2) cols = 2;
+	if (cols > 500) cols = 500;
+	if (rows < 2) rows = 2;
+	if (rows > 500) rows = 500;
 	NSSize size = [RomeView contentSizeForColumns: cols rows: rows];
 	NSRect frame = NSMakeRect(80, 80, size.width, size.height);
 	NSWindow *w = [[NSWindow alloc] initWithContentRect: frame
