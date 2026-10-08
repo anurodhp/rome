@@ -428,6 +428,11 @@ want_write_cb(void *owner)
 	[rl addEvent: (void *)(intptr_t)fd type: ET_RDESC watcher: self forMode: NSDefaultRunLoopMode];
 	[rl addEvent: (void *)(intptr_t)fd type: ET_RDESC watcher: self forMode: NSEventTrackingRunLoopMode];
 	reading = YES;
+	if (g_stats) {
+		probeLast = rome_now_ms();
+		probeTimer = [[NSTimer scheduledTimerWithTimeInterval: 0.02 target: self selector: @selector(probe:)
+		    userInfo: nil repeats: YES] retain];
+	}
 	titleTimer = [[NSTimer scheduledTimerWithTimeInterval: 0.5 target: self selector: @selector(pollTitle:)
 	    userInfo: nil repeats: YES] retain];
 	if (blinkEnabled)
@@ -526,6 +531,16 @@ want_write_cb(void *owner)
 	}
 }
 
+/* ROME_STATS: a 20 ms timer; a late firing is a run loop that was busy or
+ * blocked, which is what makes typing stall. */
+- (void) probe: (NSTimer *)t
+{
+	double now = rome_now_ms();
+	if (now - probeLast > 100)
+		fprintf(stderr, "rome: run loop stall %.0fms\n", now - probeLast - 20);
+	probeLast = now;
+}
+
 - (void) windowResized: (NSNotification *)n
 {
 	[self layoutGrid];
@@ -556,6 +571,9 @@ want_write_cb(void *owner)
 	[blinkTimer invalidate];
 	[blinkTimer release];
 	blinkTimer = nil;
+	[probeTimer invalidate];
+	[probeTimer release];
+	probeTimer = nil;
 	[titleTimer invalidate];
 	[titleTimer release];
 	titleTimer = nil;
@@ -589,12 +607,24 @@ want_write_cb(void *owner)
 		}
 		return;
 	}
-	/* Up to 256 KiB per wake-up; the frame timer runs between wake-ups, so
-	 * a flood of output is drawn at most RomeMaxFPS times a second. */
+	/* Up to 256 KiB per wake-up; a flood of output is drawn at most
+	 * RomeMaxFPS times a second (by the frame timer), a trickle at once. */
 	long n = rome_term_read(term, 256 * 1024);
 	if (n > 0) {
 		bytesRead += n;
-		[self scheduleRender];
+		if (n <= 4096 && renderer != NULL) {
+			/* Interactive output (an echo, a prompt): draw it now. Waiting out
+			 * the frame cap means waiting on a timer, and a timer can fire up
+			 * to a hundred milliseconds late (the kernel coalesces the timers
+			 * of background-class processes). Only a flood is paced by the cap. */
+			if (renderScheduled) {
+				[NSObject cancelPreviousPerformRequestsWithTarget: self selector: @selector(renderNow) object: nil];
+				renderScheduled = NO;
+			}
+			[self renderNow];
+		} else {
+			[self scheduleRender];
+		}
 	} else if (n < 0) {
 		[self childExited];
 	}

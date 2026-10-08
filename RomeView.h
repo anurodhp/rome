@@ -23,7 +23,8 @@
 	int pad;
 	double minFrameMs, lastRenderMs;
 	BOOL renderScheduled, reading, writing, exited, optionAsMeta, blinkEnabled;
-	NSTimer *blinkTimer, *titleTimer;
+	NSTimer *blinkTimer, *titleTimer, *probeTimer;
+	double probeLast;
 	NSString *oscTitle, *fgName, *shownTitle;
 	pid_t oscPgrp, fgPgrp;
 	int selClicks;
