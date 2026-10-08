@@ -71,7 +71,7 @@ default_bool(NSString *key, BOOL def)
 static RomeFont *
 open_font(void)
 {
-	NSString *fam = default_string(@"RomeFont", @"DejaVu Sans Mono");
+	NSString *fam = default_string(@"RomeFont", @"JetBrains Mono");
 	double px = default_double(@"RomeFontSize", 13);
 	if (px < 4) px = 4;
 	if (px > 200) px = 200;

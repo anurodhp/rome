@@ -44,7 +44,7 @@ Set as GNUstep defaults or on the command line (`Rome -RomeFontSize 15`):
 
 | Default | What | Default value |
 |---|---|---|
-| `RomeFont`, `RomeFontSize` | fontconfig family, size in pixels | DejaVu Sans Mono, 13 |
+| `RomeFont`, `RomeFontSize` | fontconfig family, size in pixels | JetBrains Mono, 13 |
 | `RomeColumns`, `RomeRows` | initial size | 80 × 24 |
 | `RomeScrollback` | lines kept | 5000 |
 | `RomeTheme` | `Dark`, `Pro`, `Basic` | Dark |

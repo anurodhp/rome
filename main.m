@@ -3,7 +3,7 @@
  *
  * Defaults (also as command-line arguments, e.g. -RomeRenderer gl):
  *   RomeRenderer      x11 (CPU, damage-only; the default) or gl (OpenGL)
- *   RomeFont          fontconfig family (DejaVu Sans Mono)
+ *   RomeFont          fontconfig family (JetBrains Mono; the nearest monospace font if it is not installed)
  *   RomeFontSize      pixels (13)
  *   RomeColumns, RomeRows   initial size (80 x 24)
  *   RomeScrollback    lines (5000)
