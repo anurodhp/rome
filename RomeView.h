@@ -26,7 +26,7 @@
 	NSTimer *blinkTimer, *titleTimer;
 	NSString *oscTitle, *fgName, *shownTitle;
 	pid_t oscPgrp, fgPgrp;
-	int selRow, selCol, selClicks;
+	int selClicks;
 	BOOL selecting, mouseReporting;
 	/* stats (ROME_STATS) */
 	unsigned long frames, rowsDrawn;

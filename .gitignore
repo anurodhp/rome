@@ -1,3 +1,4 @@
 obj/
 *.app/
 *.o
+.build-test/

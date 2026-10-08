@@ -1,22 +1,22 @@
 /*
  * rome: the terminal core (see RomeTerm.h).
  *
- * Damage: libvterm's screen runs with VTERM_DAMAGE_SCROLL, so it merges a
- * burst of output into one scroll (moverect) plus one damaged rectangle,
- * delivered by vterm_screen_flush_damage() at the start of a frame (or
- * earlier, when the scroll region changes). Cost per frame is therefore
- * bounded by the screen, not by how much output arrived.
+ * libghostty-vt owns the emulation: the screen, the scrollback, reflow, the
+ * selection, and the encoding of keys, mouse events and pastes. Rome keeps
+ * the pty, the theme and the frame loop.
  *
- * Per screen row the core keeps a span of columns to draw and put on the
- * screen, and a flag for rows the renderer must redraw without putting them
- * (the GL renderer after a server-side scroll). A full-width scroll is handed
- * to the renderer, which moves the window's pixels inside the X server; the
- * row spans move with it.
+ * A frame: update the render state from the terminal, then for every row
+ * libghostty-vt reports dirty (or that rome itself changed: selection,
+ * cursor) build the row's RomeCells, compare them with what the screen
+ * shows (`prev`), and hand only the columns that differ to the renderer,
+ * which puts only those pixels on the screen. Cost per frame is bounded by
+ * the screen, not by how much output arrived. The retained image of the
+ * renderer holds everything else, so an expose needs no redraw.
  */
 #define _DARWIN_C_SOURCE
 #include "RomeTerm.h"
 
-#include <vterm.h>
+#include <ghostty/vt.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -34,16 +34,17 @@
 #include <pty.h>
 #endif
 
-typedef struct {
-	int cols;
-	RomeCell *cells;
-} SbLine;
-
 struct RomeTerm {
-	VTerm *vt;
-	VTermScreen *vs;
-	VTermState *st;
+	GhosttyTerminal gt;
+	GhosttyRenderState rs;
+	GhosttyRenderStateRowIterator rit;
+	GhosttyRenderStateRowCells rcells;
+	GhosttyKeyEncoder kenc;
+	GhosttyKeyEvent kev;
+	GhosttyMouseEncoder menc;
+	GhosttyMouseEvent mev;
 	int rows, cols;
+	int cell_w, cell_h;
 	int fd;
 	pid_t pid;
 	RomeTermCallbacks cb;
@@ -51,353 +52,95 @@ struct RomeTerm {
 	RomeTheme theme;
 	RomeRenderer *r;
 
-	/* damage */
-	int *dx0, *dx1;         /* columns [dx0, dx1) to draw and present */
-	uint8_t *regen;         /* redraw the whole row, do not present */
+	/* frame state */
+	RomeCell *prev;         /* rows x cols: what the screen shows */
+	uint8_t *want;          /* rebuild this row whatever the dirty flag says */
+	RomeCell *rowbuf;
 	int full;               /* clear + redraw + present everything */
+	int hint;               /* something may have changed: render */
 	int has_expose;
 	int ex0, ey0, ex1, ey1;
 
-	/* cursor */
-	VTermPos cur;
-	int cur_visible, cur_blink, cur_shape;
+	/* cursor, as of the last frame */
+	int cur_in_view, cur_x, cur_y, cur_visible, cur_blink, cur_style, cur_tail;
 	int focused, phase;
-	int drawn_row, drawn_col, drawn_kind;   /* what the screen shows; row -1 = none */
+	int drawn_kind, drawn_x, drawn_y;   /* what the screen shows; y -1 = none */
 
-	/* scrollback ring */
-	SbLine *sb;
-	int sb_cap, sb_head, sb_count;
-	long long sb_pushed;    /* lines ever pushed: absolute line of screen row 0 */
-	int view;               /* lines scrolled back */
-
-	/* selection, absolute lines, [start, end) in reading order */
-	int has_sel;
-	long long sl0, sl1;
-	int sc0, sc1;
-
-	int mouse, alt;
-	char *title;
-	size_t title_len;
+	/* selection: the press that started it, in screen rows (stable under scrolling) */
+	int sel_clicks;
+	int anchor_x;
+	unsigned long long anchor_y;
+	int held_button;
 
 	char *out;
 	size_t out_len, out_cap;
-	RomeCell *rowbuf;
-	int rowbuf_cols;
 };
 
 /* ---- helpers ---- */
 
 static uint32_t
-color_rgb(RomeTerm *t, VTermColor c, int is_fg)
+pack(GhosttyColorRgb c)
 {
-	if (VTERM_COLOR_IS_DEFAULT_FG(&c) && is_fg)
-		return t->theme.fg;
-	if (VTERM_COLOR_IS_DEFAULT_BG(&c) && !is_fg)
-		return t->theme.bg;
-	if (VTERM_COLOR_IS_DEFAULT_FG(&c))
-		return t->theme.fg;
-	if (VTERM_COLOR_IS_DEFAULT_BG(&c))
-		return t->theme.bg;
-	vterm_screen_convert_color_to_rgb(t->vs, &c);
-	return ((uint32_t)c.rgb.red << 16) | ((uint32_t)c.rgb.green << 8) | c.rgb.blue;
+	return ((uint32_t)c.r << 16) | ((uint32_t)c.g << 8) | c.b;
 }
 
-static void
-convert_cell(RomeTerm *t, const VTermScreenCell *vc, RomeCell *rc)
+static GhosttyColorRgb
+unpack(uint32_t c)
 {
-	uint32_t ch = vc->chars[0];
-	rc->ch = ch == (uint32_t)-1 ? 0 : ch;
-	rc->width = ch == (uint32_t)-1 ? 0 : (uint8_t)vc->width;
-	uint32_t fg = color_rgb(t, vc->fg, 1), bg = color_rgb(t, vc->bg, 0);
-	if (vc->attrs.reverse) {
-		uint32_t x = fg;
-		fg = bg;
-		bg = x;
-	}
-	if (vc->attrs.conceal)
-		fg = bg;
-	rc->fg = fg;
-	rc->bg = bg;
-	rc->attrs = (vc->attrs.bold ? ROME_ATTR_BOLD : 0) | (vc->attrs.italic ? ROME_ATTR_ITALIC : 0) |
-	    (vc->attrs.underline ? ROME_ATTR_UNDERLINE : 0) | (vc->attrs.strike ? ROME_ATTR_STRIKE : 0);
-	rc->pad = 0;
+	GhosttyColorRgb r = { (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c };
+	return r;
 }
 
-static void
-mark(RomeTerm *t, int row, int x0, int x1)
+static int
+mode_get(RomeTerm *t, GhosttyMode mode)
 {
-	if (row < 0 || row >= t->rows)
-		return;
-	if (x0 < 0) x0 = 0;
-	if (x1 > t->cols) x1 = t->cols;
-	if (x1 <= x0)
-		return;
-	if (t->dx1[row] <= t->dx0[row]) {
-		t->dx0[row] = x0;
-		t->dx1[row] = x1;
-	} else {
-		if (x0 < t->dx0[row]) t->dx0[row] = x0;
-		if (x1 > t->dx1[row]) t->dx1[row] = x1;
-	}
+	GhosttyTerminalModeConfig cfg = { .mode = mode, .value = false };
+	if (ghostty_terminal_get(t->gt, GHOSTTY_TERMINAL_DATA_MODE, &cfg) != GHOSTTY_SUCCESS)
+		return 0;
+	return cfg.value;
+}
+
+static int
+scrollbar(RomeTerm *t, GhosttyTerminalScrollbar *sb)
+{
+	memset(sb, 0, sizeof(*sb));
+	return ghostty_terminal_get(t->gt, GHOSTTY_TERMINAL_DATA_SCROLLBAR, sb) == GHOSTTY_SUCCESS;
 }
 
 void
 rome_term_damage_all(RomeTerm *t)
 {
 	t->full = 1;
+	t->hint = 1;
+}
+
+static void
+want_all(RomeTerm *t)
+{
+	memset(t->want, 1, t->rows);
+	t->hint = 1;
 }
 
 static int
-alloc_rows(RomeTerm *t, int rows, int cols)
+alloc_grid(RomeTerm *t, int rows, int cols)
 {
-	int *a = realloc(t->dx0, rows * sizeof(int)), *b;
-	if (a == NULL)
+	RomeCell *prev = calloc((size_t)rows * cols, sizeof(RomeCell));
+	uint8_t *want = calloc(rows, 1);
+	RomeCell *rowbuf = calloc((size_t)cols + 1, sizeof(RomeCell));
+	if (prev == NULL || want == NULL || rowbuf == NULL) {
+		free(prev);
+		free(want);
+		free(rowbuf);
 		return 0;
-	t->dx0 = a;
-	if ((b = realloc(t->dx1, rows * sizeof(int))) == NULL)
-		return 0;
-	t->dx1 = b;
-	uint8_t *g = realloc(t->regen, rows);
-	if (g == NULL)
-		return 0;
-	t->regen = g;
-	memset(t->dx0, 0, rows * sizeof(int));
-	memset(t->dx1, 0, rows * sizeof(int));
-	memset(t->regen, 0, rows);
-	if (cols > t->rowbuf_cols) {
-		RomeCell *rb = realloc(t->rowbuf, (cols + 1) * sizeof(RomeCell));
-		if (rb == NULL)
-			return 0;
-		t->rowbuf = rb;
-		t->rowbuf_cols = cols;
 	}
+	free(t->prev);
+	free(t->want);
+	free(t->rowbuf);
+	t->prev = prev;
+	t->want = want;
+	t->rowbuf = rowbuf;
 	return 1;
 }
-
-/* ---- libvterm screen callbacks ---- */
-
-static int
-cb_damage(VTermRect rect, void *user)
-{
-	RomeTerm *t = user;
-	if (t->view != 0) {
-		t->full = 1;
-		return 1;
-	}
-	/* one column of slack each side: the other half of a wide character */
-	for (int row = rect.start_row; row < rect.end_row; row++)
-		mark(t, row, rect.start_col - 1, rect.end_col + 1);
-	return 1;
-}
-
-static int
-cb_moverect(VTermRect dest, VTermRect src, void *user)
-{
-	RomeTerm *t = user;
-	if (t->view != 0) {
-		t->full = 1;
-		return 1;
-	}
-	if (t->r == NULL || t->full || src.start_col != 0 || src.end_col != t->cols ||
-	    dest.start_col != 0 || dest.end_col != t->cols)
-		return 0;
-	int dy = dest.start_row - src.start_row;
-	int top = src.start_row, bottom = src.end_row;
-	if (dy == 0)
-		return 1;
-	/* An exposed area not yet repainted would move with the pixels. */
-	if (t->has_expose) {
-		t->ex0 = 0; t->ey0 = 0;
-		t->ex1 = t->r->width; t->ey1 = t->r->height;
-	}
-	int how = t->r->scroll(t->r, top, bottom, dy);
-	if (how == 0)
-		return 0;
-	/* The pending spans move with the content. */
-	int n = bottom - top;
-	int *s0 = malloc(n * sizeof(int)), *s1 = malloc(n * sizeof(int));
-	uint8_t *sg = malloc(n);
-	if (s0 == NULL || s1 == NULL || sg == NULL) {
-		free(s0); free(s1); free(sg);
-		t->full = 1;
-		return 1;
-	}
-	memcpy(s0, t->dx0 + top, n * sizeof(int));
-	memcpy(s1, t->dx1 + top, n * sizeof(int));
-	memcpy(sg, t->regen + top, n);
-	for (int i = 0; i < n; i++) {
-		int d = top + dy + i;
-		t->dx0[d] = s0[i];
-		t->dx1[d] = s1[i];
-		t->regen[d] = sg[i] || how == 2;
-	}
-	free(s0); free(s1); free(sg);
-	/* rows uncovered by the move: libvterm damages them; clear the stale
-	 * spans that were there */
-	if (t->drawn_row >= top && t->drawn_row < bottom)
-		t->drawn_row += dy;
-	else if (t->drawn_row >= top + dy && t->drawn_row < bottom + dy)
-		t->drawn_row = -1;      /* scrolled over: the content there is redrawn */
-	return 1;
-}
-
-static int
-cb_movecursor(VTermPos pos, VTermPos oldpos, int visible, void *user)
-{
-	RomeTerm *t = user;
-	(void)oldpos;
-	t->cur = pos;
-	t->cur_visible = visible;
-	return 1;
-}
-
-static int
-cb_settermprop(VTermProp prop, VTermValue *val, void *user)
-{
-	RomeTerm *t = user;
-	switch (prop) {
-	case VTERM_PROP_CURSORVISIBLE:
-		t->cur_visible = val->boolean;
-		break;
-	case VTERM_PROP_CURSORBLINK:
-		t->cur_blink = val->boolean;
-		break;
-	case VTERM_PROP_CURSORSHAPE:
-		t->cur_shape = val->number;
-		break;
-	case VTERM_PROP_ALTSCREEN:
-		t->alt = val->boolean;
-		t->view = 0;
-		t->full = 1;
-		break;
-	case VTERM_PROP_MOUSE:
-		t->mouse = val->number;
-		break;
-	case VTERM_PROP_TITLE: {
-		VTermStringFragment fr = val->string;
-		if (fr.initial)
-			t->title_len = 0;
-		char *n = realloc(t->title, t->title_len + fr.len + 1);
-		if (n == NULL)
-			break;
-		t->title = n;
-		memcpy(t->title + t->title_len, fr.str, fr.len);
-		t->title_len += fr.len;
-		t->title[t->title_len] = 0;
-		if (fr.final && t->cb.title != NULL)
-			t->cb.title(t->owner, t->title);
-		break;
-	}
-	default:
-		break;
-	}
-	return 1;
-}
-
-static int
-cb_bell(void *user)
-{
-	RomeTerm *t = user;
-	if (t->cb.bell != NULL)
-		t->cb.bell(t->owner);
-	return 1;
-}
-
-static int
-cb_sb_pushline(int cols, const VTermScreenCell *cells, void *user)
-{
-	RomeTerm *t = user;
-	if (t->sb_cap == 0)
-		return 1;
-	SbLine *l;
-	if (t->sb_count == t->sb_cap) {
-		l = &t->sb[t->sb_head];
-		t->sb_head = (t->sb_head + 1) % t->sb_cap;
-		t->sb_count--;
-	} else {
-		l = &t->sb[(t->sb_head + t->sb_count) % t->sb_cap];
-	}
-	/* trailing blanks with the default background are not stored */
-	int n = cols;
-	while (n > 0 && cells[n - 1].chars[0] == 0 && VTERM_COLOR_IS_DEFAULT_BG(&cells[n - 1].bg) &&
-	    !cells[n - 1].attrs.reverse)
-		n--;
-	if (l->cells == NULL || l->cols < n) {
-		RomeCell *c = realloc(l->cells, (n ? n : 1) * sizeof(RomeCell));
-		if (c == NULL)
-			return 1;
-		l->cells = c;
-	}
-	l->cols = n;
-	for (int i = 0; i < n; i++)
-		convert_cell(t, &cells[i], &l->cells[i]);
-	t->sb_count++;
-	t->sb_pushed++;
-	if (t->view != 0) {
-		/* keep the view on the same lines */
-		if (t->view < t->sb_count)
-			t->view++;
-		t->full = 1;
-	}
-	return 1;
-}
-
-static int
-cb_sb_popline(int cols, VTermScreenCell *cells, void *user)
-{
-	RomeTerm *t = user;
-	if (t->sb_count == 0)
-		return 0;
-	SbLine *l = &t->sb[(t->sb_head + t->sb_count - 1) % t->sb_cap];
-	VTermColor dfg, dbg;
-	vterm_state_get_default_colors(t->st, &dfg, &dbg);
-	for (int i = 0; i < cols; i++) {
-		VTermScreenCell *c = &cells[i];
-		memset(c, 0, sizeof(*c));
-		c->width = 1;
-		c->fg = dfg;
-		c->bg = dbg;
-		if (i < l->cols) {
-			const RomeCell *rc = &l->cells[i];
-			c->chars[0] = rc->width == 0 ? (uint32_t)-1 : rc->ch;
-			c->width = rc->width ? rc->width : 1;
-			c->attrs.bold = !!(rc->attrs & ROME_ATTR_BOLD);
-			c->attrs.italic = !!(rc->attrs & ROME_ATTR_ITALIC);
-			c->attrs.underline = !!(rc->attrs & ROME_ATTR_UNDERLINE);
-			c->attrs.strike = !!(rc->attrs & ROME_ATTR_STRIKE);
-			if (rc->fg != t->theme.fg)
-				vterm_color_rgb(&c->fg, rc->fg >> 16, rc->fg >> 8, rc->fg);
-			if (rc->bg != t->theme.bg)
-				vterm_color_rgb(&c->bg, rc->bg >> 16, rc->bg >> 8, rc->bg);
-		}
-	}
-	t->sb_count--;
-	t->sb_pushed--;
-	if (t->view > t->sb_count)
-		t->view = t->sb_count;
-	return 1;
-}
-
-static int
-cb_sb_clear(void *user)
-{
-	RomeTerm *t = user;
-	t->sb_count = 0;
-	t->view = 0;
-	t->full = 1;
-	return 1;
-}
-
-static const VTermScreenCallbacks screen_cbs = {
-	.damage = cb_damage,
-	.moverect = cb_moverect,
-	.movecursor = cb_movecursor,
-	.settermprop = cb_settermprop,
-	.bell = cb_bell,
-	.sb_pushline = cb_sb_pushline,
-	.sb_popline = cb_sb_popline,
-	.sb_clear = cb_sb_clear,
-};
 
 /* ---- output to the pty ---- */
 
@@ -445,7 +188,70 @@ send_output(RomeTerm *t)
 		t->cb.want_write(t->owner);
 }
 
+/* ---- terminal effects ---- */
+
+static void
+fx_write_pty(GhosttyTerminal gt, void *ud, const uint8_t *data, size_t len)
+{
+	(void)gt;
+	cb_output((const char *)data, len, ud);
+}
+
+static void
+fx_bell(GhosttyTerminal gt, void *ud)
+{
+	RomeTerm *t = ud;
+	(void)gt;
+	if (t->cb.bell != NULL)
+		t->cb.bell(t->owner);
+}
+
+static void
+fx_title(GhosttyTerminal gt, void *ud)
+{
+	RomeTerm *t = ud;
+	GhosttyString s = { NULL, 0 };
+	if (t->cb.title == NULL || ghostty_terminal_get(gt, GHOSTTY_TERMINAL_DATA_TITLE, &s) != GHOSTTY_SUCCESS)
+		return;
+	char *c = malloc(s.len + 1);
+	if (c == NULL)
+		return;
+	memcpy(c, s.ptr, s.len);
+	c[s.len] = 0;
+	t->cb.title(t->owner, c);
+	free(c);
+}
+
+static bool
+fx_device_attributes(GhosttyTerminal gt, void *ud, GhosttyDeviceAttributes *out)
+{
+	(void)gt;
+	(void)ud;
+	memset(out, 0, sizeof(*out));
+	out->primary.conformance_level = GHOSTTY_DA_CONFORMANCE_VT220;
+	out->primary.features[0] = GHOSTTY_DA_FEATURE_ANSI_COLOR;
+	out->primary.num_features = 1;
+	out->secondary.device_type = GHOSTTY_DA_DEVICE_TYPE_VT220;
+	out->secondary.firmware_version = 10;
+	return true;
+}
+
 /* ---- lifecycle ---- */
+
+static void
+make_palette(const RomeTheme *theme, GhosttyColorRgb pal[256])
+{
+	static const uint8_t lvl[6] = { 0, 95, 135, 175, 215, 255 };
+	for (int i = 0; i < 16; i++)
+		pal[i] = unpack(theme->palette[i]);
+	for (int i = 0; i < 216; i++) {
+		pal[16 + i].r = lvl[i / 36];
+		pal[16 + i].g = lvl[(i / 6) % 6];
+		pal[16 + i].b = lvl[i % 6];
+	}
+	for (int i = 0; i < 24; i++)
+		pal[232 + i] = (GhosttyColorRgb){ (uint8_t)(8 + 10 * i), (uint8_t)(8 + 10 * i), (uint8_t)(8 + 10 * i) };
+}
 
 RomeTerm *
 rome_term_new(int rows, int cols, int scrollback, const RomeTheme *theme, const RomeTermCallbacks *cb, void *owner)
@@ -457,48 +263,52 @@ rome_term_new(int rows, int cols, int scrollback, const RomeTheme *theme, const 
 	if (cols < 2) cols = 2;
 	t->rows = rows;
 	t->cols = cols;
+	t->cell_w = 8;
+	t->cell_h = 16;
 	t->fd = -1;
 	t->pid = -1;
 	t->theme = *theme;
 	if (cb != NULL)
 		t->cb = *cb;
 	t->owner = owner;
-	t->drawn_row = -1;
+	t->drawn_kind = 0;
+	t->drawn_y = -1;
 	t->focused = 1;
 	t->phase = 1;
 	t->cur_visible = 1;
 	t->cur_blink = 1;
-	t->cur_shape = VTERM_PROP_CURSORSHAPE_BLOCK;
 	t->full = 1;
-	if (scrollback > 0) {
-		t->sb = calloc(scrollback, sizeof(SbLine));
-		if (t->sb != NULL)
-			t->sb_cap = scrollback;
-	}
-	if (!alloc_rows(t, rows, cols)) {
+	t->hint = 1;
+	if (!alloc_grid(t, rows, cols) ||
+	    ghostty_terminal_new(NULL, &t->gt, (uint16_t)cols, (uint16_t)rows) != GHOSTTY_SUCCESS ||
+	    ghostty_render_state_new(NULL, &t->rs) != GHOSTTY_SUCCESS ||
+	    ghostty_render_state_row_iterator_new(NULL, &t->rit) != GHOSTTY_SUCCESS ||
+	    ghostty_render_state_row_cells_new(NULL, &t->rcells) != GHOSTTY_SUCCESS ||
+	    ghostty_key_encoder_new(NULL, &t->kenc) != GHOSTTY_SUCCESS ||
+	    ghostty_key_event_new(NULL, &t->kev) != GHOSTTY_SUCCESS ||
+	    ghostty_mouse_encoder_new(NULL, &t->menc) != GHOSTTY_SUCCESS ||
+	    ghostty_mouse_event_new(NULL, &t->mev) != GHOSTTY_SUCCESS) {
 		rome_term_free(t);
 		return NULL;
 	}
-	t->vt = vterm_new(rows, cols);
-	vterm_set_utf8(t->vt, 1);
-	vterm_output_set_callback(t->vt, cb_output, t);
-	t->st = vterm_obtain_state(t->vt);
-	t->vs = vterm_obtain_screen(t->vt);
-	VTermColor fg, bg;
-	vterm_color_rgb(&fg, theme->fg >> 16, theme->fg >> 8, theme->fg);
-	vterm_color_rgb(&bg, theme->bg >> 16, theme->bg >> 8, theme->bg);
-	vterm_state_set_default_colors(t->st, &fg, &bg);
-	for (int i = 0; i < 16; i++) {
-		VTermColor c;
-		uint32_t p = theme->palette[i];
-		vterm_color_rgb(&c, p >> 16, p >> 8, p);
-		vterm_state_set_palette_color(t->st, i, &c);
-	}
-	vterm_screen_set_callbacks(t->vs, &screen_cbs, t);
-	vterm_screen_set_damage_merge(t->vs, VTERM_DAMAGE_SCROLL);
-	vterm_screen_enable_altscreen(t->vs, 1);
-	vterm_screen_enable_reflow(t->vs, true);
-	vterm_screen_reset(t->vs, 1);
+	GhosttyTerminal gt = t->gt;
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_USERDATA, t);
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (const void *)fx_write_pty);
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_BELL, (const void *)fx_bell);
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED, (const void *)fx_title);
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES, (const void *)fx_device_attributes);
+	GhosttyColorRgb fg = unpack(theme->fg), bg = unpack(theme->bg), pal[256];
+	make_palette(theme, pal);
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &fg);
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &bg);
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, pal);
+	size_t lines = scrollback > 0 ? (size_t)scrollback : 0, bytes = 16u << 20;
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &lines);
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &bytes);
+	uint64_t no_images = 0;
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &no_images);
+	bool blink = true;
+	ghostty_terminal_set(gt, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK, &blink);
 	return t;
 }
 
@@ -511,16 +321,17 @@ rome_term_free(RomeTerm *t)
 		close(t->fd);
 	if (t->pid > 0)
 		kill(t->pid, SIGHUP);
-	if (t->vt != NULL)
-		vterm_free(t->vt);
-	for (int i = 0; i < t->sb_cap; i++)
-		free(t->sb[i].cells);
-	free(t->sb);
-	free(t->dx0);
-	free(t->dx1);
-	free(t->regen);
+	if (t->mev) ghostty_mouse_event_free(t->mev);
+	if (t->menc) ghostty_mouse_encoder_free(t->menc);
+	if (t->kev) ghostty_key_event_free(t->kev);
+	if (t->kenc) ghostty_key_encoder_free(t->kenc);
+	if (t->rcells) ghostty_render_state_row_cells_free(t->rcells);
+	if (t->rit) ghostty_render_state_row_iterator_free(t->rit);
+	if (t->rs) ghostty_render_state_free(t->rs);
+	if (t->gt) ghostty_terminal_free(t->gt);
+	free(t->prev);
+	free(t->want);
 	free(t->rowbuf);
-	free(t->title);
 	free(t->out);
 	free(t);
 }
@@ -578,11 +389,51 @@ pid_t rome_term_pid(RomeTerm *t) { return t->pid; }
 int rome_term_fd(RomeTerm *t) { return t->fd; }
 int rome_term_rows(RomeTerm *t) { return t->rows; }
 int rome_term_cols(RomeTerm *t) { return t->cols; }
-int rome_term_mouse_mode(RomeTerm *t) { return t->mouse; }
-int rome_term_altscreen(RomeTerm *t) { return t->alt; }
-int rome_term_view_offset(RomeTerm *t) { return t->view; }
-int rome_term_scrollback_lines(RomeTerm *t) { return t->sb_count; }
-int rome_term_cursor_blinks(RomeTerm *t) { return t->cur_blink && t->cur_visible && t->focused && t->view == 0; }
+
+int
+rome_term_mouse_mode(RomeTerm *t)
+{
+	if (mode_get(t, GHOSTTY_MODE_ANY_MOUSE))
+		return ROME_MOUSE_MOVE;
+	if (mode_get(t, GHOSTTY_MODE_BUTTON_MOUSE))
+		return ROME_MOUSE_DRAG;
+	if (mode_get(t, GHOSTTY_MODE_NORMAL_MOUSE) || mode_get(t, GHOSTTY_MODE_X10_MOUSE))
+		return ROME_MOUSE_CLICK;
+	return ROME_MOUSE_NONE;
+}
+
+int
+rome_term_altscreen(RomeTerm *t)
+{
+	GhosttyTerminalScreen s = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+	ghostty_terminal_get(t->gt, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &s);
+	return s == GHOSTTY_TERMINAL_SCREEN_ALTERNATE;
+}
+
+int
+rome_term_scrollback_lines(RomeTerm *t)
+{
+	GhosttyTerminalScrollbar sb;
+	if (!scrollbar(t, &sb))
+		return 0;
+	return sb.total > sb.len ? (int)(sb.total - sb.len) : 0;
+}
+
+int
+rome_term_view_offset(RomeTerm *t)
+{
+	GhosttyTerminalScrollbar sb;
+	if (!scrollbar(t, &sb) || sb.total < sb.len)
+		return 0;
+	unsigned long long bottom = sb.total - sb.len;
+	return sb.offset < bottom ? (int)(bottom - sb.offset) : 0;
+}
+
+int
+rome_term_cursor_blinks(RomeTerm *t)
+{
+	return t->cur_blink && t->cur_visible && t->focused && t->cur_in_view;
+}
 
 long
 rome_term_read(RomeTerm *t, long budget)
@@ -602,9 +453,11 @@ rome_term_read(RomeTerm *t, long budget)
 		}
 		if (n == 0)
 			return total > 0 ? total : -1;
-		vterm_input_write(t->vt, buf, (size_t)n);
+		ghostty_terminal_vt_write(t->gt, (const uint8_t *)buf, (size_t)n);
 		total += n;
 	}
+	if (total > 0)
+		t->hint = 1;
 	send_output(t);     /* replies to queries (DA, DSR) */
 	return total;
 }
@@ -612,7 +465,9 @@ rome_term_read(RomeTerm *t, long budget)
 void
 rome_term_feed(RomeTerm *t, const char *bytes, size_t len)
 {
-	vterm_input_write(t->vt, bytes, len);
+	ghostty_terminal_vt_write(t->gt, (const uint8_t *)bytes, len);
+	t->hint = 1;
+	send_output(t);
 }
 
 /* ---- input ---- */
@@ -620,20 +475,46 @@ rome_term_feed(RomeTerm *t, const char *bytes, size_t len)
 void
 rome_term_scroll_to_bottom(RomeTerm *t)
 {
-	if (t->view != 0) {
-		t->view = 0;
-		t->full = 1;
+	GhosttyTerminalScrollViewport b = { .tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM };
+	GhosttyTerminalScrollbar sb;
+	if (scrollbar(t, &sb) && sb.total >= sb.len && sb.offset == sb.total - sb.len)
+		return;
+	ghostty_terminal_scroll_viewport(t->gt, b);
+	t->hint = 1;
+}
+
+static GhosttyMods
+ghostty_mods(int mods)
+{
+	GhosttyMods m = 0;
+	if (mods & ROME_MOD_SHIFT) m |= GHOSTTY_MODS_SHIFT;
+	if (mods & ROME_MOD_CTRL) m |= GHOSTTY_MODS_CTRL;
+	if (mods & ROME_MOD_ALT) m |= GHOSTTY_MODS_ALT;
+	return m;
+}
+
+static size_t
+put_utf8(char *o, uint32_t c)
+{
+	if (c < 0x80) { o[0] = (char)c; return 1; }
+	if (c < 0x800) { o[0] = (char)(0xc0 | (c >> 6)); o[1] = (char)(0x80 | (c & 0x3f)); return 2; }
+	if (c < 0x10000) {
+		o[0] = (char)(0xe0 | (c >> 12)); o[1] = (char)(0x80 | ((c >> 6) & 0x3f));
+		o[2] = (char)(0x80 | (c & 0x3f)); return 3;
 	}
+	o[0] = (char)(0xf0 | (c >> 18)); o[1] = (char)(0x80 | ((c >> 12) & 0x3f));
+	o[2] = (char)(0x80 | ((c >> 6) & 0x3f)); o[3] = (char)(0x80 | (c & 0x3f)); return 4;
 }
 
 void
 rome_term_key_char(RomeTerm *t, uint32_t c, int mods)
 {
+	char b[8];
+	size_t n = 0;
 	rome_term_scroll_to_bottom(t);
-	/* Control characters are sent as bytes. libvterm sends Ctrl with
-	 * anything but a-z as a CSI u sequence (keyboard.c,
-	 * vterm_keyboard_unichar), which bash and readline do not read. */
-	if (mods & VTERM_MOD_CTRL) {
+	/* Control characters are sent as bytes (Ctrl-C is 0x03), with an ESC in
+	 * front for Alt. */
+	if (mods & ROME_MOD_CTRL) {
 		uint32_t k = c;
 		if (k >= 'A' && k <= 'Z')
 			k += 'a' - 'A';
@@ -655,9 +536,7 @@ rome_term_key_char(RomeTerm *t, uint32_t c, int mods)
 		else if (k == '?' || k == '8')
 			code = 127;
 		if (code >= 0) {
-			char b[2];
-			int n = 0;
-			if (mods & VTERM_MOD_ALT)
+			if (mods & ROME_MOD_ALT)
 				b[n++] = 0x1b;
 			b[n++] = (char)code;
 			cb_output(b, n, t);
@@ -665,30 +544,82 @@ rome_term_key_char(RomeTerm *t, uint32_t c, int mods)
 			return;
 		}
 	}
-	vterm_keyboard_unichar(t->vt, c, (VTermModifier)mods);
+	if (mods & ROME_MOD_ALT)
+		b[n++] = 0x1b;
+	n += put_utf8(b + n, c);
+	cb_output(b, n, t);
 	send_output(t);
+}
+
+static GhosttyKey
+map_key(int key)
+{
+	if (key >= ROME_KEY_F(1) && key <= ROME_KEY_F(25))
+		return (GhosttyKey)(GHOSTTY_KEY_F1 + (key - ROME_KEY_F(1)));
+	switch (key) {
+	case ROME_KEY_ENTER: return GHOSTTY_KEY_ENTER;
+	case ROME_KEY_TAB: return GHOSTTY_KEY_TAB;
+	case ROME_KEY_BACKSPACE: return GHOSTTY_KEY_BACKSPACE;
+	case ROME_KEY_ESCAPE: return GHOSTTY_KEY_ESCAPE;
+	case ROME_KEY_UP: return GHOSTTY_KEY_ARROW_UP;
+	case ROME_KEY_DOWN: return GHOSTTY_KEY_ARROW_DOWN;
+	case ROME_KEY_LEFT: return GHOSTTY_KEY_ARROW_LEFT;
+	case ROME_KEY_RIGHT: return GHOSTTY_KEY_ARROW_RIGHT;
+	case ROME_KEY_INS: return GHOSTTY_KEY_INSERT;
+	case ROME_KEY_DEL: return GHOSTTY_KEY_DELETE;
+	case ROME_KEY_HOME: return GHOSTTY_KEY_HOME;
+	case ROME_KEY_END: return GHOSTTY_KEY_END;
+	case ROME_KEY_PAGEUP: return GHOSTTY_KEY_PAGE_UP;
+	case ROME_KEY_PAGEDOWN: return GHOSTTY_KEY_PAGE_DOWN;
+	}
+	return GHOSTTY_KEY_UNIDENTIFIED;
 }
 
 void
 rome_term_key(RomeTerm *t, int key, int mods)
 {
+	char buf[64];
+	size_t n = 0;
+	GhosttyKey k = map_key(key);
+	if (k == GHOSTTY_KEY_UNIDENTIFIED)
+		return;
 	rome_term_scroll_to_bottom(t);
-	vterm_keyboard_key(t->vt, (VTermKey)key, (VTermModifier)mods);
-	send_output(t);
+	/* cursor-key mode, the Kitty flags and so on follow the terminal */
+	ghostty_key_encoder_setopt_from_terminal(t->kenc, t->gt);
+	ghostty_key_event_set_action(t->kev, GHOSTTY_KEY_ACTION_PRESS);
+	ghostty_key_event_set_key(t->kev, k);
+	ghostty_key_event_set_mods(t->kev, ghostty_mods(mods));
+	ghostty_key_event_set_consumed_mods(t->kev, 0);
+	ghostty_key_event_set_composing(t->kev, false);
+	ghostty_key_event_set_utf8(t->kev, NULL, 0);
+	if (ghostty_key_encoder_encode(t->kenc, t->kev, buf, sizeof(buf), &n) == GHOSTTY_SUCCESS && n > 0) {
+		cb_output(buf, n, t);
+		send_output(t);
+	}
 }
 
 void
 rome_term_paste(RomeTerm *t, const char *s, size_t len)
 {
 	rome_term_scroll_to_bottom(t);
-	vterm_keyboard_start_paste(t->vt);
-	/* newlines are sent as returns, as a typed paste would be */
-	for (size_t i = 0; i < len; i++) {
-		char c = s[i] == '\n' ? '\r' : s[i];
-		cb_output(&c, 1, t);
+	if (len == 0)
+		return;
+	size_t cap = len + 64, w = 0;
+	char *data = malloc(len), *buf = malloc(cap);
+	if (data == NULL || buf == NULL) {
+		free(data);
+		free(buf);
+		return;
 	}
-	vterm_keyboard_end_paste(t->vt);
-	send_output(t);
+	memcpy(data, s, len);
+	/* newlines go out as returns, as a typed paste would be; the markers
+	 * are added when the application asked for bracketed paste */
+	if (ghostty_paste_encode(data, len, mode_get(t, GHOSTTY_MODE_BRACKETED_PASTE), buf, cap, &w) == GHOSTTY_SUCCESS) {
+		cb_output(buf, w, t);
+		send_output(t);
+	}
+	free(data);
+	free(buf);
 }
 
 void
@@ -698,13 +629,50 @@ rome_term_send_raw(RomeTerm *t, const char *bytes, size_t len)
 	send_output(t);
 }
 
+static GhosttyMouseButton
+map_button(int button)
+{
+	switch (button) {
+	case 1: return GHOSTTY_MOUSE_BUTTON_LEFT;
+	case 2: return GHOSTTY_MOUSE_BUTTON_MIDDLE;
+	case 3: return GHOSTTY_MOUSE_BUTTON_RIGHT;
+	case 4: return GHOSTTY_MOUSE_BUTTON_FOUR;
+	case 5: return GHOSTTY_MOUSE_BUTTON_FIVE;
+	}
+	return GHOSTTY_MOUSE_BUTTON_UNKNOWN;
+}
+
 void
 rome_term_mouse(RomeTerm *t, int row, int col, int button, int pressed, int mods)
 {
-	vterm_mouse_move(t->vt, row, col, (VTermModifier)mods);
-	if (button > 0)
-		vterm_mouse_button(t->vt, button, pressed, (VTermModifier)mods);
-	send_output(t);
+	char buf[64];
+	size_t n = 0;
+	GhosttyMouseEncoderSize sz = {
+		.size = sizeof(sz),
+		.screen_width = (uint32_t)(t->cols * t->cell_w), .screen_height = (uint32_t)(t->rows * t->cell_h),
+		.cell_width = (uint32_t)t->cell_w, .cell_height = (uint32_t)t->cell_h,
+	};
+	ghostty_mouse_encoder_setopt_from_terminal(t->menc, t->gt);
+	ghostty_mouse_encoder_setopt(t->menc, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &sz);
+	if (button > 0) {
+		ghostty_mouse_event_set_action(t->mev, pressed ? GHOSTTY_MOUSE_ACTION_PRESS : GHOSTTY_MOUSE_ACTION_RELEASE);
+		ghostty_mouse_event_set_button(t->mev, map_button(button));
+		if (button <= 3)
+			t->held_button = pressed ? button : 0;
+	} else {
+		ghostty_mouse_event_set_action(t->mev, GHOSTTY_MOUSE_ACTION_MOTION);
+		if (t->held_button > 0)
+			ghostty_mouse_event_set_button(t->mev, map_button(t->held_button));
+		else
+			ghostty_mouse_event_clear_button(t->mev);
+	}
+	ghostty_mouse_event_set_mods(t->mev, ghostty_mods(mods));
+	ghostty_mouse_event_set_position(t->mev, (GhosttyMousePosition){
+	    .x = (float)(col * t->cell_w + t->cell_w / 2), .y = (float)(row * t->cell_h + t->cell_h / 2) });
+	if (ghostty_mouse_encoder_encode(t->menc, t->mev, buf, sizeof(buf), &n) == GHOSTTY_SUCCESS && n > 0) {
+		cb_output(buf, n, t);
+		send_output(t);
+	}
 }
 
 void
@@ -712,22 +680,18 @@ rome_term_resize(RomeTerm *t, int rows, int cols, int xpix, int ypix)
 {
 	if (rows < 2) rows = 2;
 	if (cols < 2) cols = 2;
-	if (rows == t->rows && cols == t->cols) {
-		t->full = 1;
+	if (xpix >= cols) t->cell_w = xpix / cols;
+	if (ypix >= rows) t->cell_h = ypix / rows;
+	t->full = 1;
+	t->hint = 1;
+	if (rows == t->rows && cols == t->cols)
 		return;
-	}
-	if (!alloc_rows(t, rows, cols))
+	if (!alloc_grid(t, rows, cols))
 		return;
 	t->rows = rows;
 	t->cols = cols;
-	t->full = 1;
-	t->drawn_row = -1;
-	RomeRenderer *r = t->r;
-	t->r = NULL;            /* no server-side scrolls while reflowing */
-	vterm_set_size(t->vt, rows, cols);
-	vterm_screen_flush_damage(t->vs);
-	t->r = r;
-	t->full = 1;
+	t->drawn_y = -1;
+	ghostty_terminal_resize(t->gt, (uint16_t)cols, (uint16_t)rows, (uint32_t)t->cell_w, (uint32_t)t->cell_h);
 	if (t->fd >= 0) {
 		struct winsize ws = { .ws_row = rows, .ws_col = cols, .ws_xpixel = xpix, .ws_ypixel = ypix };
 		ioctl(t->fd, TIOCSWINSZ, &ws);  /* the kernel sends SIGWINCH to the foreground group */
@@ -737,234 +701,160 @@ rome_term_resize(RomeTerm *t, int rows, int cols, int xpix, int ypix)
 void
 rome_term_scroll_view(RomeTerm *t, int delta)
 {
-	if (t->alt)
+	if (delta == 0 || rome_term_altscreen(t))
 		return;
-	int v = t->view + delta;
-	if (v < 0) v = 0;
-	if (v > t->sb_count) v = t->sb_count;
-	if (v != t->view) {
-		t->view = v;
-		t->full = 1;
-	}
-}
-
-/* ---- rows ---- */
-
-/* The cells of absolute line `abs` into `out` (cols wide). */
-static void
-get_line(RomeTerm *t, long long abs, RomeCell *out)
-{
-	RomeCell blank = { 0, t->theme.fg, t->theme.bg, 0, 1, 0 };
-	if (abs >= t->sb_pushed) {
-		int row = (int)(abs - t->sb_pushed);
-		if (row >= t->rows) {
-			for (int i = 0; i < t->cols; i++)
-				out[i] = blank;
-			return;
-		}
-		VTermScreenCell vc;
-		for (int i = 0; i < t->cols; i++) {
-			if (vterm_screen_get_cell(t->vs, (VTermPos){ row, i }, &vc))
-				convert_cell(t, &vc, &out[i]);
-			else
-				out[i] = blank;
-		}
-		return;
-	}
-	long long first = t->sb_pushed - t->sb_count;
-	int n = 0;
-	if (abs >= first && t->sb_cap > 0) {
-		SbLine *l = &t->sb[(t->sb_head + (int)(abs - first)) % t->sb_cap];
-		n = l->cols < t->cols ? l->cols : t->cols;
-		memcpy(out, l->cells, n * sizeof(RomeCell));
-		/* a wide character cut at the right edge */
-		if (n > 0 && out[n - 1].width == 2 && n == t->cols)
-			out[n - 1].width = 1;
-	}
-	for (int i = n; i < t->cols; i++)
-		out[i] = blank;
-}
-
-static int
-sel_contains(RomeTerm *t, long long line, int col)
-{
-	if (!t->has_sel)
-		return 0;
-	if (line < t->sl0 || line > t->sl1)
-		return 0;
-	if (line == t->sl0 && col < t->sc0)
-		return 0;
-	if (line == t->sl1 && col >= t->sc1)
-		return 0;
-	return 1;
-}
-
-enum { CUR_NONE, CUR_BLOCK, CUR_BOX, CUR_UNDER, CUR_BAR };
-
-static int
-cursor_kind(RomeTerm *t)
-{
-	if (t->view != 0 || !t->cur_visible)
-		return CUR_NONE;
-	if (!t->focused)
-		return CUR_BOX;
-	if (t->cur_blink && !t->phase)
-		return CUR_NONE;
-	switch (t->cur_shape) {
-	case VTERM_PROP_CURSORSHAPE_UNDERLINE: return CUR_UNDER;
-	case VTERM_PROP_CURSORSHAPE_BAR_LEFT: return CUR_BAR;
-	default: return CUR_BLOCK;
-	}
-}
-
-static void
-fetch_row(RomeTerm *t, int row, RomeCell *out, int kind)
-{
-	long long abs = t->sb_pushed + row - t->view;
-	get_line(t, abs, out);
-	if (t->has_sel && abs >= t->sl0 && abs <= t->sl1) {
-		for (int i = 0; i < t->cols; i++)
-			if (sel_contains(t, abs, i))
-				out[i].bg = t->theme.selection;
-	}
-	if (kind != CUR_NONE && row == t->cur.row && t->cur.col < t->cols) {
-		RomeCell *c = &out[t->cur.col];
-		if (c->width == 0 && t->cur.col > 0)
-			c--;
-		switch (kind) {
-		case CUR_BLOCK:
-			c->fg = c->bg;
-			c->bg = t->theme.cursor;
-			if (c->width == 2)
-				c[1].bg = t->theme.cursor;
-			break;
-		case CUR_BOX: c->attrs |= ROME_ATTR_CUR_BOX; c->fg = t->theme.cursor; break;
-		case CUR_UNDER: c->attrs |= ROME_ATTR_CUR_UNDER; c->fg = t->theme.cursor; break;
-		case CUR_BAR: c->attrs |= ROME_ATTR_CUR_BAR; c->fg = t->theme.cursor; break;
-		}
-	}
+	if (delta > 1000000) delta = 1000000;
+	if (delta < -1000000) delta = -1000000;
+	GhosttyTerminalScrollViewport b = { .tag = GHOSTTY_SCROLL_VIEWPORT_DELTA, .value = { .delta = -(intptr_t)delta } };
+	ghostty_terminal_scroll_viewport(t->gt, b);
+	t->hint = 1;
 }
 
 /* ---- selection ---- */
 
-static void
-mark_lines(RomeTerm *t, long long l0, long long l1)
+static int
+viewport_ref(RomeTerm *t, int row, int col, GhosttyGridRef *ref)
 {
-	for (int row = 0; row < t->rows; row++) {
-		long long abs = t->sb_pushed + row - t->view;
-		if (abs >= l0 && abs <= l1)
-			mark(t, row, 0, t->cols);
-	}
-}
-
-static void
-set_sel(RomeTerm *t, int has, long long l0, int c0, long long l1, int c1)
-{
-	if (t->has_sel)
-		mark_lines(t, t->sl0, t->sl1);
-	t->has_sel = has;
-	t->sl0 = l0; t->sc0 = c0;
-	t->sl1 = l1; t->sc1 = c1;
-	if (has)
-		mark_lines(t, l0, l1);
-}
-
-void
-rome_term_select(RomeTerm *t, int row0, int col0, int row1, int col1)
-{
-	long long a = t->sb_pushed + row0 - t->view, b = t->sb_pushed + row1 - t->view;
-	if (b < a || (b == a && col1 < col0)) {
-		long long x = a; a = b; b = x;
-		int y = col0; col0 = col1; col1 = y;
-	}
-	set_sel(t, 1, a, col0, b, col1 + 1);
+	GhosttyPoint p = { .tag = GHOSTTY_POINT_TAG_VIEWPORT, .value = { .coordinate = { .x = (uint16_t)col, .y = (uint32_t)row } } };
+	*ref = (GhosttyGridRef)GHOSTTY_INIT_SIZED(GhosttyGridRef);
+	return ghostty_terminal_grid_ref(t->gt, p, ref) == GHOSTTY_SUCCESS;
 }
 
 static int
-is_word(uint32_t c)
+anchor_ref(RomeTerm *t, GhosttyGridRef *ref)
 {
-	return c > ' ' && !strchr("\"'`()[]{}<>|;,", (int)(c < 128 ? c : 'a'));
+	GhosttyPoint p = { .tag = GHOSTTY_POINT_TAG_SCREEN,
+	    .value = { .coordinate = { .x = (uint16_t)t->anchor_x, .y = (uint32_t)t->anchor_y } } };
+	*ref = (GhosttyGridRef)GHOSTTY_INIT_SIZED(GhosttyGridRef);
+	return ghostty_terminal_grid_ref(t->gt, p, ref) == GHOSTTY_SUCCESS;
 }
 
-void
-rome_term_select_word(RomeTerm *t, int row, int col)
+static void
+set_selection(RomeTerm *t, const GhosttySelection *sel)
 {
-	long long abs = t->sb_pushed + row - t->view;
-	get_line(t, abs, t->rowbuf);
-	if (col >= t->cols) col = t->cols - 1;
-	int a = col, b = col;
-	if (is_word(t->rowbuf[col].ch)) {
-		while (a > 0 && is_word(t->rowbuf[a - 1].ch)) a--;
-		while (b + 1 < t->cols && is_word(t->rowbuf[b + 1].ch)) b++;
-	}
-	set_sel(t, 1, abs, a, abs, b + 1);
-}
-
-void
-rome_term_select_line(RomeTerm *t, int row)
-{
-	long long abs = t->sb_pushed + row - t->view;
-	set_sel(t, 1, abs, 0, abs, t->cols);
-}
-
-void
-rome_term_select_all(RomeTerm *t)
-{
-	set_sel(t, 1, t->sb_pushed - t->sb_count, 0, t->sb_pushed + t->rows - 1, t->cols);
+	ghostty_terminal_set(t->gt, GHOSTTY_TERMINAL_OPT_SELECTION, sel);
+	want_all(t);
 }
 
 void
 rome_term_select_clear(RomeTerm *t)
 {
-	if (t->has_sel)
-		set_sel(t, 0, 0, 0, 0, 0);
+	if (rome_term_has_selection(t)) {
+		ghostty_terminal_set(t->gt, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+		want_all(t);
+	}
 }
 
-int rome_term_has_selection(RomeTerm *t) { return t->has_sel; }
-
-static size_t
-put_utf8(char *o, uint32_t c)
+int
+rome_term_has_selection(RomeTerm *t)
 {
-	if (c < 0x80) { o[0] = (char)c; return 1; }
-	if (c < 0x800) { o[0] = (char)(0xc0 | (c >> 6)); o[1] = (char)(0x80 | (c & 0x3f)); return 2; }
-	if (c < 0x10000) {
-		o[0] = (char)(0xe0 | (c >> 12)); o[1] = (char)(0x80 | ((c >> 6) & 0x3f));
-		o[2] = (char)(0x80 | (c & 0x3f)); return 3;
+	GhosttySelection s = GHOSTTY_INIT_SIZED(GhosttySelection);
+	return ghostty_terminal_get(t->gt, GHOSTTY_TERMINAL_DATA_SELECTION, &s) == GHOSTTY_SUCCESS;
+}
+
+void
+rome_term_select_begin(RomeTerm *t, int row, int col, int clicks)
+{
+	GhosttyTerminalScrollbar sb;
+	GhosttyGridRef ref;
+	GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+	t->sel_clicks = clicks < 1 ? 1 : clicks;
+	t->anchor_x = col;
+	t->anchor_y = (unsigned long long)row + (scrollbar(t, &sb) ? sb.offset : 0);
+	if (t->sel_clicks == 1) {
+		rome_term_select_clear(t);
+		return;
 	}
-	o[0] = (char)(0xf0 | (c >> 18)); o[1] = (char)(0x80 | ((c >> 12) & 0x3f));
-	o[2] = (char)(0x80 | ((c >> 6) & 0x3f)); o[3] = (char)(0x80 | (c & 0x3f)); return 4;
+	if (!viewport_ref(t, row, col, &ref))
+		return;
+	if (t->sel_clicks == 2) {
+		GhosttyTerminalSelectWordOptions o = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordOptions);
+		o.ref = ref;
+		if (ghostty_terminal_select_word(t->gt, &o, &sel) == GHOSTTY_SUCCESS)
+			set_selection(t, &sel);
+	} else {
+		GhosttyTerminalSelectLineOptions o = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectLineOptions);
+		o.ref = ref;
+		if (ghostty_terminal_select_line(t->gt, &o, &sel) == GHOSTTY_SUCCESS)
+			set_selection(t, &sel);
+	}
+}
+
+void
+rome_term_select_extend(RomeTerm *t, int row, int col)
+{
+	GhosttyGridRef cur, anc;
+	GhosttyTerminalScrollbar sb;
+	GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+	if (!viewport_ref(t, row, col, &cur) || !anchor_ref(t, &anc))
+		return;
+	if (t->sel_clicks <= 1) {
+		sel.start = anc;
+		sel.end = cur;
+		set_selection(t, &sel);
+		return;
+	}
+	if (t->sel_clicks == 2) {
+		/* the word under the press and the word under the pointer, joined */
+		GhosttySelection a = GHOSTTY_INIT_SIZED(GhosttySelection), b = GHOSTTY_INIT_SIZED(GhosttySelection);
+		GhosttyTerminalSelectWordBetweenOptions o = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordBetweenOptions);
+		o.start = anc;
+		o.end = cur;
+		if (ghostty_terminal_select_word_between(t->gt, &o, &a) != GHOSTTY_SUCCESS)
+			return;
+		o.start = cur;
+		o.end = anc;
+		if (ghostty_terminal_select_word_between(t->gt, &o, &b) != GHOSTTY_SUCCESS)
+			return;
+		sel.start = a.start;
+		sel.end = b.end;
+		set_selection(t, &sel);
+		return;
+	}
+	GhosttySelection la = GHOSTTY_INIT_SIZED(GhosttySelection), lc = GHOSTTY_INIT_SIZED(GhosttySelection);
+	GhosttyTerminalSelectLineOptions lo = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectLineOptions);
+	lo.ref = anc;
+	if (ghostty_terminal_select_line(t->gt, &lo, &la) != GHOSTTY_SUCCESS)
+		return;
+	lo.ref = cur;
+	if (ghostty_terminal_select_line(t->gt, &lo, &lc) != GHOSTTY_SUCCESS)
+		return;
+	unsigned long long cy = (unsigned long long)row + (scrollbar(t, &sb) ? sb.offset : 0);
+	if (cy < t->anchor_y) {
+		sel.start = la.end;
+		sel.end = lc.start;
+	} else {
+		sel.start = la.start;
+		sel.end = lc.end;
+	}
+	set_selection(t, &sel);
+}
+
+void
+rome_term_select_all(RomeTerm *t)
+{
+	GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+	if (ghostty_terminal_select_all(t->gt, &sel) == GHOSTTY_SUCCESS)
+		set_selection(t, &sel);
 }
 
 char *
 rome_term_selection_text(RomeTerm *t)
 {
-	if (!t->has_sel)
+	GhosttyTerminalSelectionFormatOptions o = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectionFormatOptions);
+	uint8_t *p = NULL;
+	size_t n = 0;
+	o.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+	o.trim = true;
+	o.selection = NULL;     /* the terminal's own */
+	if (ghostty_terminal_selection_format_alloc(t->gt, NULL, o, &p, &n) != GHOSTTY_SUCCESS || p == NULL)
 		return NULL;
-	long long first = t->sb_pushed - t->sb_count;
-	long long l0 = t->sl0 < first ? first : t->sl0;
-	size_t cap = (size_t)(t->sl1 - l0 + 1) * (t->cols * 4 + 1) + 1, len = 0;
-	char *s = malloc(cap);
-	if (s == NULL)
-		return NULL;
-	for (long long l = l0; l <= t->sl1; l++) {
-		get_line(t, l, t->rowbuf);
-		int c0 = l == t->sl0 ? t->sc0 : 0, c1 = l == t->sl1 ? t->sc1 : t->cols;
-		if (c1 > t->cols) c1 = t->cols;
-		size_t start = len, end = len;
-		for (int i = c0; i < c1; i++) {
-			const RomeCell *c = &t->rowbuf[i];
-			if (c->width == 0)
-				continue;
-			len += put_utf8(s + len, c->ch ? c->ch : ' ');
-			if (c->ch && c->ch != ' ')
-				end = len;
-		}
-		(void)start;
-		len = end;              /* trailing blanks */
-		if (l != t->sl1)
-			s[len++] = '\n';
+	char *s = malloc(n + 1);
+	if (s != NULL) {
+		memcpy(s, p, n);
+		s[n] = 0;
 	}
-	s[len] = 0;
+	ghostty_free(NULL, p, n);
 	return s;
 }
 
@@ -973,19 +863,27 @@ rome_term_selection_text(RomeTerm *t)
 void
 rome_term_set_focus(RomeTerm *t, int focused)
 {
+	focused = !!focused;
+	if (focused != t->focused && mode_get(t, GHOSTTY_MODE_FOCUS_EVENT)) {
+		cb_output(focused ? "\033[I" : "\033[O", 3, t);
+		send_output(t);
+	}
 	t->focused = focused;
 	t->phase = 1;
+	t->hint = 1;
 }
 
 void
 rome_term_set_cursor_phase(RomeTerm *t, int on)
 {
 	t->phase = on;
+	t->hint = 1;
 }
 
 void
 rome_term_expose(RomeTerm *t, int x, int y, int w, int h)
 {
+	t->hint = 1;
 	if (!t->has_expose) {
 		t->has_expose = 1;
 		t->ex0 = x; t->ey0 = y; t->ex1 = x + w; t->ey1 = y + h;
@@ -1000,80 +898,218 @@ rome_term_expose(RomeTerm *t, int x, int y, int w, int h)
 int
 rome_term_needs_render(RomeTerm *t)
 {
-	if (t->full || t->has_expose)
-		return 1;
-	if (t->drawn_kind != cursor_kind(t) || t->drawn_row != t->cur.row || t->drawn_col != t->cur.col)
-		return 1;
-	for (int i = 0; i < t->rows; i++)
-		if (t->dx1[i] > t->dx0[i] || t->regen[i])
-			return 1;
-	return 0;
+	return t->full || t->has_expose || t->hint;
+}
+
+enum { CUR_NONE, CUR_BLOCK, CUR_BOX, CUR_UNDER, CUR_BAR };
+
+static int
+cursor_kind(RomeTerm *t)
+{
+	if (!t->cur_in_view || !t->cur_visible)
+		return CUR_NONE;
+	if (!t->focused)
+		return CUR_BOX;
+	if (t->cur_blink && !t->phase)
+		return CUR_NONE;
+	switch (t->cur_style) {
+	case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE: return CUR_UNDER;
+	case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR: return CUR_BAR;
+	case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW: return CUR_BOX;
+	default: return CUR_BLOCK;
+	}
+}
+
+static uint32_t
+dim(uint32_t fg, uint32_t bg)
+{
+	uint32_t r = ((fg >> 16 & 255) * 2 + (bg >> 16 & 255)) / 3;
+	uint32_t g = ((fg >> 8 & 255) * 2 + (bg >> 8 & 255)) / 3;
+	uint32_t b = ((fg & 255) * 2 + (bg & 255)) / 3;
+	return r << 16 | g << 8 | b;
+}
+
+/* The cells of the iterator's current row into t->rowbuf, selection applied. */
+static void
+build_row(RomeTerm *t, const GhosttyRenderStateColors *col)
+{
+	RomeCell *out = t->rowbuf;
+	uint32_t dfg = pack(col->foreground), dbg = pack(col->background);
+	GhosttyRenderStateRowSelection rsel = GHOSTTY_INIT_SIZED(GhosttyRenderStateRowSelection);
+	int has_sel = 0, x = 0;
+	has_sel = ghostty_render_state_row_get(t->rit, GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION, &rsel) == GHOSTTY_SUCCESS;
+	if (ghostty_render_state_row_get(t->rit, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &t->rcells) == GHOSTTY_SUCCESS) {
+		while (x < t->cols && ghostty_render_state_row_cells_next(t->rcells)) {
+			RomeCell *c = &out[x];
+			GhosttyCell raw = 0;
+			uint32_t cp = 0;
+			int wide = GHOSTTY_CELL_WIDE_NARROW;
+			bool styled = false;
+			GhosttyColorRgb rgb;
+			uint32_t fg = dfg, bg = dbg;
+			uint8_t attrs = 0;
+			ghostty_render_state_row_cells_get(t->rcells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw);
+			ghostty_cell_get(raw, GHOSTTY_CELL_DATA_CODEPOINT, &cp);
+			ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
+			ghostty_cell_get(raw, GHOSTTY_CELL_DATA_HAS_STYLING, &styled);
+			if (ghostty_render_state_row_cells_get(t->rcells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &rgb) == GHOSTTY_SUCCESS)
+				bg = pack(rgb);
+			if (styled) {
+				GhosttyStyle st = GHOSTTY_INIT_SIZED(GhosttyStyle);
+				if (ghostty_render_state_row_cells_get(t->rcells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &rgb) == GHOSTTY_SUCCESS)
+					fg = pack(rgb);
+				if (ghostty_render_state_row_cells_get(t->rcells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &st) == GHOSTTY_SUCCESS) {
+					if (st.faint)
+						fg = dim(fg, bg);
+					if (st.inverse) {
+						uint32_t v = fg;
+						fg = bg;
+						bg = v;
+					}
+					if (st.invisible)
+						fg = bg;
+					attrs = (st.bold ? ROME_ATTR_BOLD : 0) | (st.italic ? ROME_ATTR_ITALIC : 0) |
+					    (st.underline ? ROME_ATTR_UNDERLINE : 0) | (st.strikethrough ? ROME_ATTR_STRIKE : 0);
+				}
+			}
+			c->ch = cp;
+			c->width = wide == GHOSTTY_CELL_WIDE_WIDE ? 2 : wide == GHOSTTY_CELL_WIDE_SPACER_TAIL ? 0 : 1;
+			if (c->width == 0)
+				c->ch = 0;
+			c->fg = fg;
+			c->bg = bg;
+			c->attrs = attrs;
+			c->pad = 0;
+			x++;
+		}
+	}
+	for (; x < t->cols; x++)
+		out[x] = (RomeCell){ 0, dfg, dbg, 0, 1, 0 };
+	if (has_sel) {
+		for (int i = rsel.start_x; i <= (int)rsel.end_x && i < t->cols; i++)
+			out[i].bg = t->theme.selection;
+	}
+}
+
+static void
+apply_cursor(RomeTerm *t, int kind)
+{
+	RomeCell *c = &t->rowbuf[t->cur_x < t->cols ? t->cur_x : t->cols - 1];
+	if (c->width == 0 && t->cur_x > 0)
+		c--;
+	switch (kind) {
+	case CUR_BLOCK:
+		c->fg = c->bg;
+		c->bg = t->theme.cursor;
+		if (c->width == 2)
+			c[1].bg = t->theme.cursor;
+		break;
+	case CUR_BOX: c->attrs |= ROME_ATTR_CUR_BOX; c->fg = t->theme.cursor; break;
+	case CUR_UNDER: c->attrs |= ROME_ATTR_CUR_UNDER; c->fg = t->theme.cursor; break;
+	case CUR_BAR: c->attrs |= ROME_ATTR_CUR_BAR; c->fg = t->theme.cursor; break;
+	}
+}
+
+static int
+cell_eq(const RomeCell *a, const RomeCell *b)
+{
+	return a->ch == b->ch && a->fg == b->fg && a->bg == b->bg && a->attrs == b->attrs && a->width == b->width;
 }
 
 int
 rome_term_render(RomeTerm *t, RomeRenderer *r)
 {
+	GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
+	GhosttyRenderStateCursor cur = GHOSTTY_INIT_SIZED(GhosttyRenderStateCursor);
+	GhosttyRenderStateDirty dirty = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
+	RomeFont *f = r->font;
+	RomeRect rects[64];
+	int nrects = 0, drawn = 0, y = 0;
+
 	t->r = r;
-	vterm_screen_flush_damage(t->vs);
+	if (ghostty_render_state_update(t->rs, t->gt) != GHOSTTY_SUCCESS)
+		return 0;
 	if (r->want_full_redraw) {
 		r->want_full_redraw = 0;
 		t->full = 1;
 	}
+	ghostty_render_state_get(t->rs, GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
+	/* A global change (selection, colours, scrolling the viewport): look at
+	 * every row, but still draw and put only the cells that differ. */
+	if (dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL)
+		memset(t->want, 1, t->rows);
+	ghostty_render_state_get(t->rs, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors);
+	ghostty_render_state_get(t->rs, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cur);
+	t->cur_in_view = cur.viewport_has_value;
+	t->cur_x = cur.viewport_x;
+	t->cur_y = cur.viewport_y;
+	t->cur_tail = cur.wide_tail;
+	t->cur_visible = cur.visible;
+	t->cur_blink = cur.blinking;
+	t->cur_style = cur.visual_style;
+	if (t->cur_x >= t->cols) t->cur_x = t->cols - 1;
+	if (t->cur_y >= t->rows) t->cur_y = t->rows - 1;
 	int kind = cursor_kind(t);
-	if (kind != t->drawn_kind || t->cur.row != t->drawn_row || t->cur.col != t->drawn_col) {
-		if (t->drawn_row >= 0)
-			mark(t, t->drawn_row, t->drawn_col - 1, t->drawn_col + 2);
-		mark(t, t->cur.row, t->cur.col - 1, t->cur.col + 2);
-		t->drawn_row = t->cur.row;
-		t->drawn_col = t->cur.col;
+	if (kind != t->drawn_kind || t->cur_y != t->drawn_y || t->cur_x != t->drawn_x) {
+		if (t->drawn_y >= 0 && t->drawn_y < t->rows)
+			t->want[t->drawn_y] = 1;
+		if (kind != CUR_NONE)
+			t->want[t->cur_y] = 1;
 		t->drawn_kind = kind;
+		t->drawn_x = t->cur_x;
+		t->drawn_y = kind != CUR_NONE ? t->cur_y : -1;
 	}
 
-	RomeFont *f = r->font;
 	r->begin(r);
-	RomeRect rects[64];
-	int nrects = 0, drawn = 0;
-	if (t->full) {
+	if (t->full)
 		r->clear(r, t->cols, t->rows);
-		for (int i = 0; i < t->rows; i++) {
-			t->dx0[i] = 0;
-			t->dx1[i] = t->cols;
-		}
-	}
-	for (int row = 0; row < t->rows; row++) {
-		int x0 = t->dx0[row], x1 = t->dx1[row];
-		int present = x1 > x0;
-		if (!present && !t->regen[row])
-			continue;
-		if (!present) {
-			x0 = 0;
-			x1 = t->cols;
-		}
-		fetch_row(t, row, t->rowbuf, kind);
-		if (x0 > 0 && t->rowbuf[x0].width == 0)
-			x0--;
-		if (x1 < t->cols && x1 > 0 && t->rowbuf[x1 - 1].width == 2)
-			x1++;
-		r->draw_row(r, row, x0, x1, t->rowbuf);
-		drawn++;
-		if (present && !t->full) {
-			RomeRect b = { r->padx + x0 * f->cell_w, r->pady + row * f->cell_h, (x1 - x0) * f->cell_w, f->cell_h };
-			/* merge with the previous rectangle when it ends on the row above */
-			if (nrects > 0 && rects[nrects - 1].y + rects[nrects - 1].h == b.y) {
-				RomeRect *p = &rects[nrects - 1];
-				int nx0 = p->x < b.x ? p->x : b.x;
-				int nx1 = p->x + p->w > b.x + b.w ? p->x + p->w : b.x + b.w;
-				p->x = nx0;
-				p->w = nx1 - nx0;
-				p->h += b.h;
-			} else if (nrects < 63) {
-				rects[nrects++] = b;
-			} else {
-				t->full = 1;    /* too many pieces: put the whole window */
+	if (ghostty_render_state_get(t->rs, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &t->rit) == GHOSTTY_SUCCESS) {
+		while (y < t->rows && ghostty_render_state_row_iterator_next(t->rit)) {
+			bool row_dirty = false;
+			ghostty_render_state_row_get(t->rit, GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, &row_dirty);
+			if (!t->full && !row_dirty && !t->want[y]) {
+				y++;
+				continue;
 			}
+			RomeCell *prev = t->prev + (size_t)y * t->cols;
+			int x0 = 0, x1 = t->cols;
+			build_row(t, &colors);
+			if (kind != CUR_NONE && y == t->cur_y)
+				apply_cursor(t, kind);
+			if (!t->full) {
+				while (x0 < t->cols && cell_eq(&t->rowbuf[x0], &prev[x0]))
+					x0++;
+				while (x1 > x0 && cell_eq(&t->rowbuf[x1 - 1], &prev[x1 - 1]))
+					x1--;
+			}
+			if (x1 > x0) {
+				if (x0 > 0 && t->rowbuf[x0].width == 0)
+					x0--;
+				if (x1 < t->cols && x1 > 0 && t->rowbuf[x1 - 1].width == 2)
+					x1++;
+				r->draw_row(r, y, x0, x1, t->rowbuf);
+				drawn++;
+				memcpy(prev, t->rowbuf, (size_t)t->cols * sizeof(RomeCell));
+				if (!t->full) {
+					RomeRect b = { r->padx + x0 * f->cell_w, r->pady + y * f->cell_h, (x1 - x0) * f->cell_w, f->cell_h };
+					/* merge with the previous rectangle when it ends on the row above */
+					if (nrects > 0 && rects[nrects - 1].y + rects[nrects - 1].h == b.y) {
+						RomeRect *p = &rects[nrects - 1];
+						int nx0 = p->x < b.x ? p->x : b.x;
+						int nx1 = p->x + p->w > b.x + b.w ? p->x + p->w : b.x + b.w;
+						p->x = nx0;
+						p->w = nx1 - nx0;
+						p->h += b.h;
+					} else if (nrects < 63) {
+						rects[nrects++] = b;
+					} else {
+						t->full = 1;    /* too many pieces: put the whole window */
+					}
+				}
+			}
+			t->want[y] = 0;
+			y++;
 		}
-		t->dx0[row] = t->dx1[row] = 0;
-		t->regen[row] = 0;
 	}
 	if (t->full) {
 		nrects = 1;
@@ -1082,7 +1118,10 @@ rome_term_render(RomeTerm *t, RomeRenderer *r)
 		rects[nrects++] = (RomeRect){ t->ex0, t->ey0, t->ex1 - t->ex0, t->ey1 - t->ey0 };
 	}
 	t->full = 0;
+	t->hint = 0;
 	t->has_expose = 0;
+	memset(t->want, 0, t->rows);
+	ghostty_render_state_clean(t->rs);
 	r->present(r, rects, nrects);
 	return drawn;
 }

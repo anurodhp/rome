@@ -1,10 +1,10 @@
 /*
  * rome: the cell model shared by the terminal core and the renderers.
  *
- * The core (RomeTerm.c) turns libvterm's screen and the scrollback into rows
+ * The core (RomeTerm.c) turns libghostty-vt's screen and scrollback into rows
  * of RomeCell, already resolved to RGB with reverse video, selection and the
  * cursor applied. A renderer only has to put cells on the screen; it never
- * sees libvterm.
+ * sees libghostty-vt.
  *
  * Both renderers draw into a child X window of the GNUstep window, on rome's
  * own X connection (RomeX.c), and keep the window's pixels in step with a

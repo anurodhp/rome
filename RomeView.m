@@ -4,7 +4,6 @@
 #import "RomeView.h"
 #import <GNUstepGUI/GSDisplayServer.h>
 #include "RomeX.h"
-#include <vterm.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -721,13 +720,13 @@ want_write_cb(void *owner)
 
 /* ---- keyboard ---- */
 
-- (int) vtermMods: (NSEvent *)ev
+- (int) keyMods: (NSEvent *)ev
 {
 	unsigned f = [ev modifierFlags];
 	int m = 0;
-	if (f & NSShiftKeyMask) m |= VTERM_MOD_SHIFT;
-	if (f & NSControlKeyMask) m |= VTERM_MOD_CTRL;
-	if ((f & NSAlternateKeyMask) && optionAsMeta) m |= VTERM_MOD_ALT;
+	if (f & NSShiftKeyMask) m |= ROME_MOD_SHIFT;
+	if (f & NSControlKeyMask) m |= ROME_MOD_CTRL;
+	if ((f & NSAlternateKeyMask) && optionAsMeta) m |= ROME_MOD_ALT;
 	return m;
 }
 
@@ -739,53 +738,53 @@ want_write_cb(void *owner)
 	if (flags & NSCommandKeyMask)
 		return;             /* menu key equivalents only */
 	NSString *chars = [ev characters], *raw = [ev charactersIgnoringModifiers];
-	int mods = [self vtermMods: ev];
+	int mods = [self keyMods: ev];
 	unichar c = [raw length] ? [raw characterAtIndex: 0] : ([chars length] ? [chars characterAtIndex: 0] : 0);
-	int key = VTERM_KEY_NONE;
+	int key = ROME_KEY_NONE;
 	int rows = rome_term_rows(term);
 	switch (c) {
-	case NSUpArrowFunctionKey: key = VTERM_KEY_UP; break;
-	case NSDownArrowFunctionKey: key = VTERM_KEY_DOWN; break;
-	case NSLeftArrowFunctionKey: key = VTERM_KEY_LEFT; break;
-	case NSRightArrowFunctionKey: key = VTERM_KEY_RIGHT; break;
+	case NSUpArrowFunctionKey: key = ROME_KEY_UP; break;
+	case NSDownArrowFunctionKey: key = ROME_KEY_DOWN; break;
+	case NSLeftArrowFunctionKey: key = ROME_KEY_LEFT; break;
+	case NSRightArrowFunctionKey: key = ROME_KEY_RIGHT; break;
 	case NSHomeFunctionKey:
-		if (mods & VTERM_MOD_SHIFT) { rome_term_scroll_view(term, 1 << 30); [self scheduleRender]; return; }
-		key = VTERM_KEY_HOME; break;
+		if (mods & ROME_MOD_SHIFT) { rome_term_scroll_view(term, 1 << 30); [self scheduleRender]; return; }
+		key = ROME_KEY_HOME; break;
 	case NSEndFunctionKey:
-		if (mods & VTERM_MOD_SHIFT) { rome_term_scroll_to_bottom(term); [self scheduleRender]; return; }
-		key = VTERM_KEY_END; break;
+		if (mods & ROME_MOD_SHIFT) { rome_term_scroll_to_bottom(term); [self scheduleRender]; return; }
+		key = ROME_KEY_END; break;
 	case NSPageUpFunctionKey:
-		if (mods & VTERM_MOD_SHIFT) { rome_term_scroll_view(term, rows - 1); [self scheduleRender]; return; }
-		key = VTERM_KEY_PAGEUP; break;
+		if (mods & ROME_MOD_SHIFT) { rome_term_scroll_view(term, rows - 1); [self scheduleRender]; return; }
+		key = ROME_KEY_PAGEUP; break;
 	case NSPageDownFunctionKey:
-		if (mods & VTERM_MOD_SHIFT) { rome_term_scroll_view(term, -(rows - 1)); [self scheduleRender]; return; }
-		key = VTERM_KEY_PAGEDOWN; break;
-	case NSInsertFunctionKey: key = VTERM_KEY_INS; break;
-	case NSDeleteFunctionKey: key = VTERM_KEY_DEL; break;
-	case '\r': case 3: key = VTERM_KEY_ENTER; break;
-	case '\t': case 0x19: key = VTERM_KEY_TAB; break;
-	case 0x7f: case 8: key = VTERM_KEY_BACKSPACE; break;
-	case 0x1b: key = VTERM_KEY_ESCAPE; break;
+		if (mods & ROME_MOD_SHIFT) { rome_term_scroll_view(term, -(rows - 1)); [self scheduleRender]; return; }
+		key = ROME_KEY_PAGEDOWN; break;
+	case NSInsertFunctionKey: key = ROME_KEY_INS; break;
+	case NSDeleteFunctionKey: key = ROME_KEY_DEL; break;
+	case '\r': case 3: key = ROME_KEY_ENTER; break;
+	case '\t': case 0x19: key = ROME_KEY_TAB; break;
+	case 0x7f: case 8: key = ROME_KEY_BACKSPACE; break;
+	case 0x1b: key = ROME_KEY_ESCAPE; break;
 	default:
 		if (c >= NSF1FunctionKey && c <= NSF35FunctionKey) {
-			key = VTERM_KEY_FUNCTION((int)(c - NSF1FunctionKey + 1));
+			key = ROME_KEY_F((int)(c - NSF1FunctionKey + 1));
 		}
 		break;
 	}
 	[self cursorActivity];
 	[NSCursor setHiddenUntilMouseMoves: YES];
-	if (rome_term_has_selection(term) && !(mods & VTERM_MOD_SHIFT))
+	if (rome_term_has_selection(term) && !(mods & ROME_MOD_SHIFT))
 		rome_term_select_clear(term);
-	if (key != VTERM_KEY_NONE) {
+	if (key != ROME_KEY_NONE) {
 		if (c == 0x19)
-			mods |= VTERM_MOD_SHIFT;
+			mods |= ROME_MOD_SHIFT;
 		rome_term_key(term, key, mods);
 		[self scheduleRender];
 		return;
 	}
 	/* With Control or Meta the key's own character (Ctrl-C is 'c');
 	 * otherwise the composed text. */
-	NSString *s = (mods & (VTERM_MOD_CTRL | VTERM_MOD_ALT)) ? raw : chars;
+	NSString *s = (mods & (ROME_MOD_CTRL | ROME_MOD_ALT)) ? raw : chars;
 	NSUInteger n = [s length];
 	for (NSUInteger i = 0; i < n; i++) {
 		uint32_t u = [s characterAtIndex: i];
@@ -840,7 +839,7 @@ want_write_cb(void *owner)
 {
 	int row, col;
 	[self cellAt: ev row: &row col: &col clamp: YES];
-	rome_term_mouse(term, row, col, button, pressed, [self vtermMods: ev] & ~VTERM_MOD_SHIFT);
+	rome_term_mouse(term, row, col, button, pressed, [self keyMods: ev] & ~ROME_MOD_SHIFT);
 }
 
 - (void) mouseDown: (NSEvent *)ev
@@ -857,15 +856,8 @@ want_write_cb(void *owner)
 	int row, col;
 	[self cellAt: ev row: &row col: &col clamp: YES];
 	selClicks = (int)[ev clickCount];
-	selRow = row;
-	selCol = col;
 	selecting = YES;
-	if (selClicks == 2)
-		rome_term_select_word(term, row, col);
-	else if (selClicks >= 3)
-		rome_term_select_line(term, row);
-	else
-		rome_term_select_clear(term);
+	rome_term_select_begin(term, row, col, selClicks);
 	[self scheduleRender];
 }
 
@@ -874,7 +866,7 @@ want_write_cb(void *owner)
 	if (term == NULL)
 		return;
 	if (mouseReporting) {
-		if (rome_term_mouse_mode(term) >= VTERM_PROP_MOUSE_DRAG)
+		if (rome_term_mouse_mode(term) >= ROME_MOUSE_DRAG)
 			[self mouseEvent: ev button: 0 pressed: 0];
 		return;
 	}
@@ -882,7 +874,7 @@ want_write_cb(void *owner)
 		return;
 	int row, col;
 	[self cellAt: ev row: &row col: &col clamp: YES];
-	rome_term_select(term, selRow, selCol, row, col);
+	rome_term_select_extend(term, row, col);
 	[self scheduleRender];
 }
 
@@ -929,7 +921,7 @@ want_write_cb(void *owner)
 	if (rome_term_altscreen(term)) {
 		/* less, vim, man: the wheel moves the text */
 		for (int i = 0; i < 3 * abs(steps); i++)
-			rome_term_key(term, steps > 0 ? VTERM_KEY_UP : VTERM_KEY_DOWN, 0);
+			rome_term_key(term, steps > 0 ? ROME_KEY_UP : ROME_KEY_DOWN, 0);
 		return;
 	}
 	rome_term_scroll_view(term, 3 * steps);
@@ -972,7 +964,7 @@ want_write_cb(void *owner)
 {
 	if (term == NULL)
 		return;
-	/* ED 3 (xterm): erase the saved lines; libvterm calls sb_clear */
+	/* ED 3 (xterm): erase the saved lines */
 	rome_term_feed(term, "\033[3J", 4);
 	[self scheduleRender];
 }
