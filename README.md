@@ -32,11 +32,36 @@ How these were taken, and what they do not show:
 - Scrollback with a scroll bar, the mouse wheel and Shift+PageUp/Down; selection by drag, double-click (word) and triple-click (line); copy and paste.
 - Mouse reporting for programs that ask for it (vim, htop, less).
 - The window and tab title follow the foreground program (`bash`, `htop`, ...), or what the program sets itself.
-- Unicode: wide (CJK, Hangul, kana, fullwidth) and zero-width characters, combining marks, and fallback to other installed fonts for scripts the main font lacks (the image carries GNU Unifont for the Basic Multilingual Plane and Noto Emoji; `tools/unicode_sample.txt` shows what works).
+- Kitty keyboard protocol (presses, repeats and releases for programs that ask), and a confirmation before pasting multiple lines into a program that has not asked for bracketed paste.
+- Unicode: see below.
 - Dark theme by default (white on black); `Pro` and `Basic` (black on white) are available.
 - Resizes with the window; the shell is told (SIGWINCH).
 - Two renderers: the default draws into an MIT-SHM image on the CPU and puts only the changed cells on the screen; `-RomeRenderer gl` uses OpenGL through Mesa.
 - Small: a few thousand lines of C and Objective-C.
+
+## Unicode
+
+| Supported | |
+|---|---|
+| Text | Latin with accents (precomposed and decomposed), Greek, Cyrillic, Vietnamese, Hebrew and Arabic letters, Thai, Devanagari |
+| Width | double-width CJK, Hangul, kana and fullwidth forms; zero-width characters |
+| Combining marks | drawn over their letter (accents, Thai and Indic vowel signs, Hebrew points, Arabic harakat) |
+| Symbols | box drawing, blocks and shades, Braille, arrows, maths, currency |
+| Emoji | monochrome outlines (Noto Emoji) |
+| Fonts | JetBrains Mono, then DejaVu Sans Mono, then any installed font that has the character (GNU Unifont covers the whole Basic Multilingual Plane) |
+| Input | any text the keyboard produces, including characters outside the BMP |
+
+Not yet: Arabic joining and Devanagari conjuncts (no shaping), right-to-left reordering, colour emoji, and emoji sequences (ZWJ, skin tones, flags show the first emoji only). `tools/unicode_sample.txt` shows what works.
+
+## Roadmap
+
+1. Text shaping with HarfBuzz: Arabic joining, Devanagari conjuncts.
+2. Bidirectional text with FriBidi.
+3. Colour emoji (a colour glyph atlas, Noto Color Emoji).
+4. Emoji sequences: ZWJ, skin tones, flags.
+5. Image protocols: Sixel and Kitty graphics.
+
+Details are in `TODO.md`.
 
 ## Settings
 
@@ -96,9 +121,7 @@ make ADDITIONAL_CPPFLAGS="-I/path/to/ghostty/include -I/usr/include/freetype2" \
 
 ## Known limitations
 
-- Text shaping: combining marks (accents, Thai, Hebrew, Arabic and Indic vowel signs) are drawn over their letters, but Arabic letters are not joined, Devanagari conjuncts are not formed, right-to-left text is not reordered, and emoji sequences (ZWJ, skin tones, flags) show their first emoji only.
-- Emoji are monochrome outlines (the glyph atlas has one channel).
-- No image protocols (Sixel, Kitty graphics); the terminal ignores them.
+- The roadmap items above are the known gaps: no shaping, no right-to-left reordering, monochrome emoji, no image protocols (Sixel and Kitty graphics are ignored).
 
 ## Licence
 
