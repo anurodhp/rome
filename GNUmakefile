@@ -8,7 +8,7 @@
 include $(GNUSTEP_MAKEFILES)/common.make
 
 APP_NAME = Rome
-VERSION = 0.1
+VERSION = 1.0
 Rome_OBJC_FILES = main.m RomeView.m RomeTabs.m
 Rome_C_FILES = RomeTerm.c RomeFont.c RomeX.c RomeRenderX11.c RomeRenderGL.c
 Rome_MAIN_MODEL_FILE =

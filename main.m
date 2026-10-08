@@ -41,13 +41,28 @@ add_item(NSMenu *m, NSString *title, SEL action, NSString *key)
 
 @implementation RomeController
 
+- (void) showAbout: (id)sender
+{
+	/* the keys GNUstep's info panel reads (GSInfoPanel.m) */
+	NSDictionary *opts = [NSDictionary dictionaryWithObjectsAndKeys:
+	    @"Rome", @"ApplicationName",
+	    @"A small, fast terminal for GNUstep.", @"ApplicationDescription",
+	    @"1.0", @"ApplicationRelease",
+	    [NSArray arrayWithObject: @"Anurodh Pokharel"], @"Authors",
+	    @"Copyright \u00a9 2026 Anurodh Pokharel. MIT licence.", @"Copyright",
+	    @"Terminal emulation by libghostty-vt, from Ghostty (ghostty.org), "
+	    @"copyright \u00a9 2024 Mitchell Hashimoto, Ghostty contributors. MIT licence.", @"CopyrightDescription",
+	    nil];
+	[NSApp orderFrontStandardAboutPanelWithOptions: opts];
+}
+
 - (void) buildMenus
 {
 	NSMenu *main = [[NSMenu alloc] initWithTitle: @"Rome"];
 	NSMenu *m;
 
 	m = [[NSMenu alloc] initWithTitle: @"Rome"];
-	add_item(m, @"About Rome", @selector(orderFrontStandardAboutPanel:), nil);
+	add_item(m, @"About Rome", @selector(showAbout:), nil);
 	add_item(m, @"Hide Rome", @selector(hide:), @"h");
 	add_item(m, @"Quit Rome", @selector(terminate:), @"q");
 	[main setSubmenu: m forItem: add_item(main, @"Rome", NULL, nil)];
