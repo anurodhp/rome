@@ -88,6 +88,9 @@ struct RomeRenderer {
 RomeRenderer *rome_render_x11_new(RomeFont *font, unsigned long parent, int x, int y, int w, int h);
 RomeRenderer *rome_render_gl_new(RomeFont *font, unsigned long parent, int x, int y, int w, int h);
 
+/* Map or unmap the renderer's child window (a hidden tab). */
+void rome_render_show(RomeRenderer *r, int show);
+
 /* Move the renderer's child window inside its parent. */
 void rome_render_move(RomeRenderer *r, int x, int y);
 unsigned long rome_render_window(RomeRenderer *r);

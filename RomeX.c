@@ -98,6 +98,18 @@ rome_render_move(RomeRenderer *r, int x, int y)
 	}
 }
 
+void
+rome_render_show(RomeRenderer *r, int show)
+{
+	if (g_dpy != NULL && r->win != 0) {
+		if (show)
+			XMapWindow(g_dpy, (Window)r->win);
+		else
+			XUnmapWindow(g_dpy, (Window)r->win);
+		XFlush(g_dpy);
+	}
+}
+
 unsigned long
 rome_render_window(RomeRenderer *r)
 {

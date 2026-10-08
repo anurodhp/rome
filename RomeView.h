@@ -18,6 +18,8 @@
 	NSSize laidOut;
 	NSPoint laidOrigin;
 	uint32_t themeBg;
+	id controller;
+	BOOL tabHidden;
 	int pad;
 	double minFrameMs, lastRenderMs;
 	BOOL renderScheduled, reading, writing, exited, optionAsMeta, blinkEnabled;
@@ -36,6 +38,11 @@
 - (id) initWithFrame: (NSRect)frame command: (NSArray *)argv;
 + (NSSize) contentSizeForColumns: (int)cols rows: (int)rows;
 - (NSSize) cellSize;
+- (void) start;
+- (id) controller;
+- (void) setController: (id)c;
+- (void) setTabVisible: (BOOL)visible;
+- (NSString *) title;
 - (void) shutdown;
 - (const char *) rendererName;
 - (void) sendBenchKey: (unichar)c;

@@ -18,6 +18,7 @@
  */
 #import <AppKit/AppKit.h>
 #import "RomeView.h"
+#import "RomeTabs.h"
 #include <signal.h>
 #include <stdio.h>
 #include <sys/wait.h>
@@ -26,6 +27,7 @@
 {
 	int windows;
 	NSPoint cascade;
+	NSMutableArray *controllers;
 	RomeView *benchView;
 	int benchLeft;
 }
@@ -53,7 +55,11 @@ add_item(NSMenu *m, NSString *title, SEL action, NSString *key)
 
 	m = [[NSMenu alloc] initWithTitle: @"Shell"];
 	add_item(m, @"New Window", @selector(newWindow:), @"n");
-	add_item(m, @"Close Window", @selector(performClose:), @"w");
+	add_item(m, @"New Tab", @selector(newTab:), @"t");
+	add_item(m, @"Close Tab", @selector(closeTab:), @"w");
+	add_item(m, @"Close Window", @selector(performClose:), @"W");
+	add_item(m, @"Next Tab", @selector(nextTab:), @"}");
+	add_item(m, @"Previous Tab", @selector(previousTab:), @"{");
 	[main setSubmenu: m forItem: add_item(main, @"Shell", NULL, nil)];
 	[m release];
 
@@ -95,12 +101,17 @@ add_item(NSMenu *m, NSString *title, SEL action, NSString *key)
 	    backing: NSBackingStoreBuffered defer: NO];
 	[w setTitle: @"Terminal"];
 	[w setReleasedWhenClosed: YES];
-	RomeView *v = [[RomeView alloc] initWithFrame: NSMakeRect(0, 0, size.width, size.height) command: [self command]];
+	RomeWindowController *wc = [[RomeWindowController alloc] initWithWindow: w command: [self command]];
+	RomeView *v = [wc addTab];
 	if (v == nil) {
+		[wc release];
 		[w release];
 		return nil;
 	}
-	[w setContentView: v];
+	if (controllers == nil)
+		controllers = [NSMutableArray new];
+	[controllers addObject: wc];
+	[wc release];
 	[w setResizeIncrements: [v cellSize]];
 	[w setMinSize: NSMakeSize(200, 100)];
 	if (windows > 0)
@@ -111,7 +122,6 @@ add_item(NSMenu *m, NSString *title, SEL action, NSString *key)
 	[w makeFirstResponder: v];
 	/* the view must be in a mapped window before its X child is made */
 	[v performSelector: @selector(start)];
-	[v release];
 	windows++;
 	[[NSNotificationCenter defaultCenter] addObserver: self selector: @selector(windowClosed:)
 	    name: NSWindowWillCloseNotification object: w];
@@ -123,8 +133,26 @@ add_item(NSMenu *m, NSString *title, SEL action, NSString *key)
 	[self openWindow];
 }
 
+- (RomeWindowController *) keyController
+{
+	id d = [[NSApp keyWindow] delegate];
+	return [d isKindOfClass: [RomeWindowController class]] ? d : nil;
+}
+
+- (void) newTab: (id)sender { [[self keyController] newTab: sender]; }
+- (void) closeTab: (id)sender { [[self keyController] closeTab: sender]; }
+- (void) nextTab: (id)sender { [[self keyController] nextTab: sender]; }
+- (void) previousTab: (id)sender { [[self keyController] previousTab: sender]; }
+
 - (void) windowClosed: (NSNotification *)n
 {
+	for (NSUInteger i = 0; i < [controllers count]; i++) {
+		if ([[controllers objectAtIndex: i] window] == [n object]) {
+			[[n object] setDelegate: nil];  /* the controller goes with it */
+			[controllers removeObjectAtIndex: i];
+			break;
+		}
+	}
 	windows--;
 	if (windows <= 0)
 		[NSApp terminate: self];
@@ -141,7 +169,7 @@ add_item(NSMenu *m, NSString *title, SEL action, NSString *key)
 	}
 	/* Terminal's default: close the window when the shell exited cleanly */
 	if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-		[[v window] performSelector: @selector(performClose:) withObject: nil afterDelay: 0];
+		[[v controller] performSelector: @selector(closeView:) withObject: v afterDelay: 0];
 }
 
 - (void) benchType: (NSTimer *)t

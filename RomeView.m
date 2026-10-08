@@ -223,6 +223,9 @@ want_write_cb(void *owner)
 - (BOOL) acceptsFirstResponder { return YES; }
 - (BOOL) becomeFirstResponder { return YES; }
 - (NSSize) cellSize { return NSMakeSize(font->cell_w, font->cell_h); }
+- (id) controller { return controller; }
+- (void) setController: (id)c { controller = c; }
+- (NSString *) title { return shownTitle != nil ? shownTitle : @"Terminal"; }
 - (const char *) rendererName { return renderer ? renderer->name : "none"; }
 
 - (void) drawRect: (NSRect)r
@@ -450,7 +453,7 @@ want_write_cb(void *owner)
 
 - (void) windowFocus: (NSNotification *)n
 {
-	rome_term_set_focus(term, [[self window] isKeyWindow]);
+	rome_term_set_focus(term, !tabHidden && [[self window] isKeyWindow]);
 	[self scheduleRender];
 }
 
@@ -465,7 +468,10 @@ want_write_cb(void *owner)
 		return;
 	[shownTitle release];
 	shownTitle = [t retain];
-	[[self window] setTitle: t];
+	if (controller != nil)
+		[controller romeView: self titleChanged: t];
+	else
+		[[self window] setTitle: t];
 }
 
 - (void) applicationSetTitle: (NSString *)t
@@ -500,6 +506,25 @@ want_write_cb(void *owner)
 		fgName = [process_name(pg) retain];
 	}
 	[self showTitle: fgName];
+}
+
+/* Shown or hidden as the window's selected tab. A hidden tab keeps reading its
+ * pty but draws nothing, and its X child is unmapped. */
+- (void) setTabVisible: (BOOL)visible
+{
+	if (visible == !tabHidden)
+		return;
+	tabHidden = !visible;
+	[self setHidden: tabHidden];
+	if (renderer != NULL)
+		rome_render_show(renderer, visible);
+	if (term != NULL)
+		rome_term_set_focus(term, visible && [[self window] isKeyWindow]);
+	if (visible && renderer != NULL) {
+		[self layoutGrid];
+		rome_term_damage_all(term);
+		[self scheduleRender];
+	}
 }
 
 - (void) windowResized: (NSNotification *)n
@@ -621,7 +646,7 @@ want_write_cb(void *owner)
 - (void) renderNow
 {
 	renderScheduled = NO;
-	if (renderer == NULL || term == NULL)
+	if (renderer == NULL || term == NULL || tabHidden)
 		return;
 	if (rome_term_needs_render(term)) {
 		double t0 = rome_now_ms();
