@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert an xwd screenshot (xwd -root) from the Pi to PNG, honouring the file's own format.
 
-    tools/xwd2png.py shot.xwd [shot.png]
+    tools/xwd2png.py shot.xwd [shot.png] [--crop X,Y,W,H] [--scale N]
 
 The Pi's X server reports bits_per_pixel 24 with a 4-byte-aligned stride: pixels are packed
 3 bytes each, and a row is padded out to bytes_per_line. Reading them as 32-bit words squashes the
@@ -53,11 +53,36 @@ def write_png(path, w, h, raw):
                 chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
+def crop_scale(w, h, raw, crop, scale):
+    """Crop (x, y, w, h) and enlarge by an integer factor (nearest neighbour), for reading small text."""
+    stride = 1 + w * 3
+    x0, y0, cw, ch = crop if crop else (0, 0, w, h)
+    rows = []
+    for y in range(y0, min(h, y0 + ch)):
+        row = raw[y * stride + 1 + x0 * 3: y * stride + 1 + min(w, x0 + cw) * 3]
+        if scale > 1:
+            row = b"".join(row[i:i + 3] * scale for i in range(0, len(row), 3))
+        rows += [b"\x00" + row] * scale
+    return (min(w, x0 + cw) - x0) * scale, len(rows), b"".join(rows)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
+    args = [a for a in sys.argv[1:]]
+    crop, scale = None, 1
+    if "--crop" in args:
+        i = args.index("--crop")
+        crop = tuple(int(v) for v in args[i + 1].split(","))
+        del args[i:i + 2]
+    if "--scale" in args:
+        i = args.index("--scale")
+        scale = int(args[i + 1])
+        del args[i:i + 2]
+    if not args:
         raise SystemExit(__doc__)
-    src = sys.argv[1]
-    dst = sys.argv[2] if len(sys.argv) > 2 else src.rsplit(".", 1)[0] + ".png"
+    src = args[0]
+    dst = args[1] if len(args) > 1 else src.rsplit(".", 1)[0] + ".png"
     w, h, raw = convert(open(src, "rb").read())
+    if crop or scale > 1:
+        w, h, raw = crop_scale(w, h, raw, crop, scale)
     write_png(dst, w, h, raw)
     print("%s: %dx%d" % (dst, w, h))

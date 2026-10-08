@@ -222,6 +222,20 @@ draw_cell(X11R *x, int px, int py, int ncells, const RomeCell *c)
 			}
 		}
 	}
+	for (int k = 0; k < 2; k++) {
+		if (c->mark[k] == 0)
+			continue;
+		int ms = rome_font_glyph(f, c->mark[k], style | ROME_STYLE_MARK, ncells == 2);
+		if (ms < 0)
+			continue;
+		const uint8_t *a = f->atlas + (size_t)rome_font_slot_y(f, ms) * f->atlas_w + rome_font_slot_x(f, ms);
+		for (int y = 0; y < ch; y++, a += f->atlas_w) {
+			uint32_t *p = x->pix + (size_t)(py + y) * x->stride + px;
+			for (int i = 0; i < cw; i++)
+				if (a[i] != 0)
+					p[i] = blend(p[i], fg, a[i]);
+		}
+	}
 	int lp = f->line_px;
 	if (c->attrs & ROME_ATTR_UNDERLINE)
 		fill(x, px, py + f->underline_y, cw, lp, fg);

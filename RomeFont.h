@@ -19,6 +19,9 @@ enum {
 	ROME_STYLE_BOLD = 1,
 	ROME_STYLE_ITALIC = 2,
 	ROME_STYLE_BOLD_ITALIC = 3,
+	/* or'd into a style for rome_font_glyph(): the code point is a combining mark, drawn in the
+	 * cell of the character it combines with (zero-advance glyphs are placed back over it) */
+	ROME_STYLE_MARK = 4,
 };
 
 typedef struct RomeFont RomeFont;

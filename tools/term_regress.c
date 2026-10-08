@@ -168,6 +168,18 @@ int main(void)
 		CHECK(kill(pid, 0) < 0, "the shell of a closed terminal is still there (zombie)");
 	}
 
+	/* combining marks reach the cell; joiners and ZWJ emoji do not */
+	t = fresh(6, 40, 100);
+	feed(t, "e\xcc\x81" "x\r\n");                                 /* e + U+0301, x */
+	feed(t, "\xe0\xb8\x81\xe0\xb8\xb4\xe0\xb8\xb8\r\n");           /* Thai: ko kai + sara i + sara u */
+	feed(t, "\033[?2027h\xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x91\xa9\r\n");   /* man ZWJ woman, clustered */
+	rome_term_render(t, &rnd);
+	CHECK(grid[0][0].ch == 'e' && grid[0][0].mark[0] == 0x301, "e + U+0301: ch %x mark %x", grid[0][0].ch, grid[0][0].mark[0]);
+	CHECK(grid[0][1].ch == 'x' && grid[0][1].mark[0] == 0, "the x after it was disturbed");
+	CHECK(grid[1][0].ch == 0xe01 && grid[1][0].mark[0] == 0xe34 && grid[1][0].mark[1] == 0xe38, "Thai marks: %x %x", grid[1][0].mark[0], grid[1][0].mark[1]);
+	CHECK(grid[2][0].ch == 0x1f468 && grid[2][0].mark[0] == 0, "ZWJ sequence draws extra glyphs: mark %x", grid[2][0].mark[0]);
+	rome_term_free(t);
+
 	printf(failures ? "%d regression test(s) FAILED\n" : "all regression tests passed\n", failures);
 	return failures != 0;
 }

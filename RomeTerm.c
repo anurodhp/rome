@@ -1154,6 +1154,18 @@ dim(uint32_t fg, uint32_t bg)
 	return r << 16 | g << 8 | b;
 }
 
+/* An extra code point of a grapheme cluster that is drawn over its base character: the combining
+ * marks (accents, Hebrew points, Arabic harakat, Thai and Indic vowel signs, ...). Not drawn: joiners,
+ * variation selectors, skin-tone modifiers, tags (nothing to see, a missing-glyph box if drawn), the
+ * emoji of a ZWJ sequence (would overprint the first), or conjoining Hangul jamo (need shaping). */
+static int
+draws_as_mark(uint32_t cp)
+{
+	if (cp == 0x34f || (cp >= 0x1100 && cp <= 0x11ff) || (cp >= 0x180b && cp <= 0x180f))
+		return 0;
+	return (cp >= 0x300 && cp < 0x2000) || (cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0xfe20 && cp <= 0xfe2f);
+}
+
 /* The cells of the iterator's current row into t->rowbuf, selection applied. */
 static void
 build_row(RomeTerm *t, const GhosttyRenderStateColors *col)
@@ -1161,8 +1173,15 @@ build_row(RomeTerm *t, const GhosttyRenderStateColors *col)
 	RomeCell *out = t->rowbuf;
 	uint32_t dfg = pack(col->foreground), dbg = pack(col->background);
 	GhosttyRenderStateRowSelection rsel = GHOSTTY_INIT_SIZED(GhosttyRenderStateRowSelection);
-	int has_sel = 0, x = 0;
+	int has_sel = 0, x = 0, has_graphemes = 0;
 	has_sel = ghostty_render_state_row_get(t->rit, GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION, &rsel) == GHOSTTY_SUCCESS;
+	{
+		GhosttyRow raw_row = 0;
+		bool g = false;
+		if (ghostty_render_state_row_get(t->rit, GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw_row) == GHOSTTY_SUCCESS &&
+		    ghostty_row_get(raw_row, GHOSTTY_ROW_DATA_GRAPHEME, &g) == GHOSTTY_SUCCESS)
+			has_graphemes = g;
+	}
 	if (ghostty_render_state_row_get(t->rit, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &t->rcells) == GHOSTTY_SUCCESS) {
 		while (x < t->cols && ghostty_render_state_row_cells_next(t->rcells)) {
 			RomeCell *c = &out[x];
@@ -1197,6 +1216,18 @@ build_row(RomeTerm *t, const GhosttyRenderStateColors *col)
 					    (st.underline ? ROME_ATTR_UNDERLINE : 0) | (st.strikethrough ? ROME_ATTR_STRIKE : 0);
 				}
 			}
+			c->mark[0] = c->mark[1] = 0;
+			if (has_graphemes) {
+				uint32_t glen = 0, gbuf[16];
+				ghostty_render_state_row_cells_get(t->rcells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, &glen);
+				if (glen > 1 && glen <= 16 &&
+				    ghostty_render_state_row_cells_get(t->rcells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, gbuf) == GHOSTTY_SUCCESS) {
+					int nm = 0;
+					for (uint32_t gi = 1; gi < glen && nm < 2; gi++)
+						if (draws_as_mark(gbuf[gi]))
+							c->mark[nm++] = gbuf[gi];
+				}
+			}
 			c->ch = cp;
 			c->width = wide == GHOSTTY_CELL_WIDE_WIDE ? 2 : wide == GHOSTTY_CELL_WIDE_SPACER_TAIL ? 0 : 1;
 			if (c->width == 0)
@@ -1209,7 +1240,7 @@ build_row(RomeTerm *t, const GhosttyRenderStateColors *col)
 		}
 	}
 	for (; x < t->cols; x++)
-		out[x] = (RomeCell){ 0, dfg, dbg, 0, 1, 0 };
+		out[x] = (RomeCell){ .ch = 0, .fg = dfg, .bg = dbg, .width = 1 };
 	if (has_sel) {
 		for (int i = rsel.start_x; i <= (int)rsel.end_x && i < t->cols; i++)
 			out[i].bg = t->theme.selection;
@@ -1238,7 +1269,8 @@ apply_cursor(RomeTerm *t, int kind)
 static int
 cell_eq(const RomeCell *a, const RomeCell *b)
 {
-	return a->ch == b->ch && a->fg == b->fg && a->bg == b->bg && a->attrs == b->attrs && a->width == b->width;
+	return a->ch == b->ch && a->fg == b->fg && a->bg == b->bg && a->attrs == b->attrs && a->width == b->width &&
+	    a->mark[0] == b->mark[0] && a->mark[1] == b->mark[1];
 }
 
 int

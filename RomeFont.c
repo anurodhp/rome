@@ -18,6 +18,7 @@ typedef struct {
 	FT_Library ft;
 	FT_Face face[4];             /* by ROME_STYLE_*; may repeat */
 	FcFontSet *fallback_set;     /* fontconfig's sorted list, for missing glyphs */
+	FcPattern *query;            /* the pattern that list was sorted for: FcFontRenderPrepare needs it */
 	FT_Face fallback[MAX_FALLBACK];
 	int nfallback_tried;
 	uint32_t *keys;              /* key + 1, 0 = empty */
@@ -79,8 +80,10 @@ match_face(Priv *p, const char *family, double px, int style, char **matched_fam
 		}
 		FcPatternDestroy(m);
 	}
-	if (style == ROME_STYLE_REGULAR && p->fallback_set == NULL)
+	if (style == ROME_STYLE_REGULAR && p->fallback_set == NULL) {
 		p->fallback_set = FcFontSort(NULL, pat, FcTrue, NULL, &res);
+		p->query = FcPatternDuplicate(pat);
+	}
 	FcPatternDestroy(pat);
 	return face;
 }
@@ -174,6 +177,8 @@ rome_font_free(RomeFont *f)
 				FT_Done_Face(p->fallback[i]);
 		if (p->fallback_set != NULL)
 			FcFontSetDestroy(p->fallback_set);
+		if (p->query != NULL)
+			FcPatternDestroy(p->query);
 		if (p->ft != NULL)
 			FT_Done_FreeType(p->ft);
 		free(p->keys);
@@ -204,7 +209,7 @@ face_for(RomeFont *f, uint32_t cp, int style, FT_UInt *gi)
 		    !FcCharSetHasChar(cs, cp))
 			continue;
 		if (p->fallback[i] == NULL) {
-			FcPattern *m = FcFontRenderPrepare(NULL, p->fallback_set->fonts[i], p->fallback_set->fonts[i]);
+			FcPattern *m = FcFontRenderPrepare(NULL, p->query, p->fallback_set->fonts[i]);
 			if (m == NULL)
 				continue;
 			p->fallback[i] = open_face(p, m, f->px);
@@ -235,6 +240,8 @@ static void
 rasterise(RomeFont *f, int slot, uint32_t cp, int style, int wide)
 {
 	FT_UInt gi;
+	int mark = (style & ROME_STYLE_MARK) != 0;
+	style &= 3;
 	FT_Face face = face_for(f, cp, style, &gi);
 	int sx = rome_font_slot_x(f, slot), sy = rome_font_slot_y(f, slot);
 	int w = wide ? 2 * f->cell_w : f->cell_w;
@@ -245,12 +252,18 @@ rasterise(RomeFont *f, int slot, uint32_t cp, int style, int wide)
 	if (bm->pixel_mode != FT_PIXEL_MODE_GRAY)
 		return;
 	int ox = g->bitmap_left, oy = f->ascent - g->bitmap_top;
-	/* A glyph wider than its cell (fallback fonts) is centred and clipped. */
-	if ((int)bm->width > w)
+	if (mark) {
+		/* A zero-advance mark is positioned relative to the pen after its base character, so it
+		 * sits at a negative offset: move it from the end of the cell back over the base. */
+		if (g->advance.x == 0)
+			ox += w;
+	} else if ((int)bm->width > w) {
+		/* A glyph wider than its cell (fallback fonts) is centred and clipped. */
 		ox = (w - (int)bm->width) / 2;
-	else if (ox + (int)bm->width > w)
+	} else if (ox + (int)bm->width > w) {
 		ox = w - (int)bm->width;
-	if (ox < 0 && (int)bm->width <= w)
+	}
+	if (!mark && ox < 0 && (int)bm->width <= w)
 		ox = 0;
 	for (unsigned r = 0; r < bm->rows; r++) {
 		int y = oy + (int)r;
@@ -346,7 +359,8 @@ rome_font_glyph(RomeFont *f, uint32_t cp, int style, int wide)
 	Priv *p = f->priv;
 	if (cp == 0 || cp == ' ' || cp == 0xa0)
 		return -1;
-	uint32_t key = (cp & 0x1fffff) | ((uint32_t)(style & 3) << 21) | ((uint32_t)(wide != 0) << 23);
+	uint32_t key = (cp & 0x1fffff) | ((uint32_t)(style & 3) << 21) | ((uint32_t)(wide != 0) << 23) |
+	    ((uint32_t)((style & ROME_STYLE_MARK) != 0) << 24);
 	uint32_t h = (key * 2654435761u) & (HASH_SIZE - 1);
 	while (p->keys[h] != 0) {
 		if (p->keys[h] == key + 1)
@@ -358,7 +372,7 @@ rome_font_glyph(RomeFont *f, uint32_t cp, int style, int wide)
 		h = (key * 2654435761u) & (HASH_SIZE - 1);
 	}
 	int slot = p->next_slot++;
-	if (!draw_box(f, slot, cp))
+	if ((style & ROME_STYLE_MARK) || !draw_box(f, slot, cp))
 		rasterise(f, slot, cp, style, wide);
 	p->keys[h] = key + 1;
 	p->vals[h] = slot;

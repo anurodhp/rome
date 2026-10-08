@@ -213,6 +213,13 @@ gl_draw_row(RomeRenderer *r, int row, int x0, int x1, const RomeCell *cells)
 		int slot = rome_font_glyph(f, c->ch, style, n == 2);
 		if (slot >= 0)
 			batch_quad(&g->fg, px, py, w, ch, rome_font_slot_x(f, slot), rome_font_slot_y(f, slot), c->fg);
+		for (int k = 0; k < 2; k++) {
+			if (c->mark[k] == 0)
+				continue;
+			int ms = rome_font_glyph(f, c->mark[k], style | ROME_STYLE_MARK, n == 2);
+			if (ms >= 0)
+				batch_quad(&g->fg, px, py, w, ch, rome_font_slot_x(f, ms), rome_font_slot_y(f, ms), c->fg);
+		}
 		if (c->attrs & (ROME_ATTR_UNDERLINE | ROME_ATTR_STRIKE | ROME_ATTR_CUR_UNDER | ROME_ATTR_CUR_BAR | ROME_ATTR_CUR_BOX)) {
 			if (c->attrs & ROME_ATTR_UNDERLINE)
 				batch_quad(&g->fg, px, py + f->underline_y, w, lp, -1, -1, c->fg);

@@ -32,6 +32,7 @@ How these were taken, and what they do not show:
 - Scrollback with a scroll bar, the mouse wheel and Shift+PageUp/Down; selection by drag, double-click (word) and triple-click (line); copy and paste.
 - Mouse reporting for programs that ask for it (vim, htop, less).
 - The window and tab title follow the foreground program (`bash`, `htop`, ...), or what the program sets itself.
+- Unicode: wide (CJK, Hangul, kana, fullwidth) and zero-width characters, combining marks, and fallback to other installed fonts for scripts the main font lacks (the image carries GNU Unifont for the Basic Multilingual Plane and Noto Emoji; `tools/unicode_sample.txt` shows what works).
 - Dark theme by default (white on black); `Pro` and `Basic` (black on white) are available.
 - Resizes with the window; the shell is told (SIGWINCH).
 - Two renderers: the default draws into an MIT-SHM image on the CPU and puts only the changed cells on the screen; `-RomeRenderer gl` uses OpenGL through Mesa.
@@ -95,7 +96,8 @@ make ADDITIONAL_CPPFLAGS="-I/path/to/ghostty/include -I/usr/include/freetype2" \
 
 ## Known limitations
 
-- Combining characters and emoji sequences: only the first code point of a cell is drawn.
+- Text shaping: combining marks (accents, Thai, Hebrew, Arabic and Indic vowel signs) are drawn over their letters, but Arabic letters are not joined, Devanagari conjuncts are not formed, right-to-left text is not reordered, and emoji sequences (ZWJ, skin tones, flags) show their first emoji only.
+- Emoji are monochrome outlines (the glyph atlas has one channel).
 - No image protocols (Sixel, Kitty graphics); the terminal ignores them.
 - Pasting without bracketed paste mode sends every line, as typing would.
 - Kitty keyboard protocol: key presses are reported, key releases are not.

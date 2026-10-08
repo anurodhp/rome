@@ -36,6 +36,7 @@ typedef struct {
 	uint8_t attrs;      /* ROME_ATTR_* */
 	uint8_t width;      /* 1, 2 (wide), 0 (right half of a wide cell) */
 	uint16_t pad;
+	uint32_t mark[2];   /* combining marks drawn over ch (accents, vowel signs); 0 = none */
 } RomeCell;
 
 typedef struct {

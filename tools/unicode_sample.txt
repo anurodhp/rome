@@ -1,0 +1,21 @@
+Rome Unicode check -- each line should look like its label
+Latin accents   : café naïve Zürich Ñandú Ångström ß œ ø Ł
+Greek           : α β γ δ λ μ π Σ Ω  Ελληνικά
+Cyrillic        : Привет, мир! Ёж Щука
+Hebrew / Arabic : שלום  مرحبا   (right-to-left is not reordered)
+Box drawing     : ┌──┬──┐ │ ├──┼──┤ └──┴──┘ ╔══╗ ║ ╚══╝
+Blocks / shades : ▀▄█▌▐ ░▒▓ ■ □ ▲ ▼ ◆ ●
+Arrows / math   : ← ↑ → ↓ ⇒ ∀ ∃ ∑ ∫ √ ∞ ≠ ≤ ≥ ≈ ∈ ⊂
+Currency / misc : € £ ¥ ₹ ₿ © ® ™ ° ± × ÷ § ¶ • … — – ‘’ “”
+Braille         : ⠁⠃⠉⠙⠑⠋⠛⠓⠊⠚ ⣿
+Fullwidth       : ＡＢＣ１２３ ｱｲｳ
+CJK (wide)      : 日本語 中文 한국어 の ひらがな カタカナ
+Emoji           : 😀 👍 🎉 ❤ ✔ ⭐
+Combining       : é ñ ä (decomposed) vs é ñ ä (precomposed)
+Thai marks      : กินข้าว ผู้หญิง ที่นี่
+Vietnamese      : Việt Nam (precomposed)  Việt (decomposed)
+Hebrew points   : שָׁלוֹם  (letters with niqqud)
+Arabic marks    : مَرْحَبًا  (harakat; letters not joined)
+Devanagari      : हिन्दी नमस्ते  (vowel signs; no conjunct shaping)
+Wide edge       : |日|本|語|
+Ruler           : 0123456789012345678901234567890123456789
