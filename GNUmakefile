@@ -12,7 +12,8 @@ VERSION = 0.1
 Rome_OBJC_FILES = main.m RomeView.m
 Rome_C_FILES = RomeTerm.c RomeFont.c RomeX.c RomeRenderX11.c RomeRenderGL.c
 Rome_MAIN_MODEL_FILE =
-Rome_APPLICATION_ICON =
+Rome_APPLICATION_ICON = Rome.png
+Rome_RESOURCE_FILES = Rome.png
 Rome_LOCALIZED_RESOURCE_FILES =
 
 ADDITIONAL_CFLAGS += -std=gnu99 -O2 -Wall
