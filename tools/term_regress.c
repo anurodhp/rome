@@ -180,6 +180,38 @@ int main(void)
 	CHECK(grid[2][0].ch == 0x1f468 && grid[2][0].mark[0] == 0, "ZWJ sequence draws extra glyphs: mark %x", grid[2][0].mark[0]);
 	rome_term_free(t);
 
+	/* key releases and repeats are sent under the Kitty protocol's event-type flag, and only then */
+	t = fresh(6, 40, 100);
+	rome_term_key_event(t, ROME_KEY_RELEASE, ROME_KEY_NONE, 'c', ROME_MOD_CTRL);
+	rome_term_key_event(t, ROME_KEY_RELEASE, ROME_KEY_UP, 0, 0);
+	CHECK(t->out_len == 0, "a release without the Kitty protocol sent %zu bytes", t->out_len);
+	rome_term_key_event(t, ROME_KEY_REPEAT, ROME_KEY_NONE, 'x', 0);
+	s = out_take(t);
+	CHECK(!strcmp(s, "x"), "a repeat without the protocol is [%s], not a press", s);
+	feed(t, "\033[>3u");                         /* disambiguate + report event types */
+	out_take(t);
+	rome_term_key_event(t, ROME_KEY_PRESS, ROME_KEY_NONE, 'c', ROME_MOD_CTRL);
+	s = out_take(t);
+	CHECK(!strcmp(s, "\033[99;5u"), "Ctrl-C press under event types: [%s]", s);
+	rome_term_key_event(t, ROME_KEY_RELEASE, ROME_KEY_NONE, 'c', ROME_MOD_CTRL);
+	s = out_take(t);
+	CHECK(!strcmp(s, "\033[99;5:3u"), "Ctrl-C release under event types: [%s]", s);
+	rome_term_key_event(t, ROME_KEY_RELEASE, ROME_KEY_UP, 0, 0);
+	s = out_take(t);
+	CHECK(!strcmp(s, "\033[1;1:3A"), "Up release under event types: [%s]", s);
+	rome_term_key_event(t, ROME_KEY_REPEAT, ROME_KEY_NONE, 'c', ROME_MOD_CTRL);
+	s = out_take(t);
+	CHECK(!strcmp(s, "\033[99;5:2u"), "Ctrl-C repeat under event types: [%s]", s);
+	rome_term_free(t);
+
+	/* a paste that would run lines asks first, unless the program asked for bracketed pastes */
+	t = fresh(6, 40, 100);
+	CHECK(rome_term_paste_needs_confirm(t, "a\nb", 3), "multi-line paste not flagged");
+	CHECK(!rome_term_paste_needs_confirm(t, "ab", 2), "one-line paste flagged");
+	feed(t, "\033[?2004h");
+	CHECK(!rome_term_paste_needs_confirm(t, "a\nb", 3), "bracketed paste flagged");
+	rome_term_free(t);
+
 	printf(failures ? "%d regression test(s) FAILED\n" : "all regression tests passed\n", failures);
 	return failures != 0;
 }

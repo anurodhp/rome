@@ -71,6 +71,11 @@ int rome_term_write_pending(RomeTerm *t);
 /* Keyboard: a Unicode character or a ROME_KEY_*, with ROME_MOD_* bits. */
 void rome_term_key_char(RomeTerm *t, uint32_t c, int mods);
 void rome_term_key(RomeTerm *t, int key, int mods);
+enum { ROME_KEY_PRESS = 0, ROME_KEY_REPEAT, ROME_KEY_RELEASE };
+/* A special key (`key`, else the character `c`), with its action. */
+void rome_term_key_event(RomeTerm *t, int action, int key, uint32_t c, int mods);
+/* 1 when a paste would run lines in a program that has not asked for pastes (no bracketed paste mode). */
+int rome_term_paste_needs_confirm(RomeTerm *t, const char *utf8, size_t len);
 void rome_term_paste(RomeTerm *t, const char *utf8, size_t len);
 void rome_term_send_raw(RomeTerm *t, const char *bytes, size_t len);
 /* Mouse reporting to the application; returns 0 when it has not asked. */

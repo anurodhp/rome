@@ -771,60 +771,37 @@ want_write_cb(void *owner)
 	return m;
 }
 
-- (void) keyDown: (NSEvent *)ev
+/* The special key a function-key character stands for (ROME_KEY_NONE for text). */
+static int
+special_key_for(unichar c)
 {
-	if (term == NULL || exited)
-		return;
-	unsigned flags = [ev modifierFlags];
-	if (flags & NSCommandKeyMask)
-		return;             /* menu key equivalents only */
-	NSString *chars = [ev characters], *raw = [ev charactersIgnoringModifiers];
-	int mods = [self keyMods: ev];
-	unichar c = [raw length] ? [raw characterAtIndex: 0] : ([chars length] ? [chars characterAtIndex: 0] : 0);
-	int key = ROME_KEY_NONE;
-	int rows = rome_term_rows(term);
 	switch (c) {
-	case NSUpArrowFunctionKey: key = ROME_KEY_UP; break;
-	case NSDownArrowFunctionKey: key = ROME_KEY_DOWN; break;
-	case NSLeftArrowFunctionKey: key = ROME_KEY_LEFT; break;
-	case NSRightArrowFunctionKey: key = ROME_KEY_RIGHT; break;
-	case NSHomeFunctionKey:
-		if (mods & ROME_MOD_SHIFT) { rome_term_scroll_view(term, 1 << 30); [self scheduleRender]; return; }
-		key = ROME_KEY_HOME; break;
-	case NSEndFunctionKey:
-		if (mods & ROME_MOD_SHIFT) { rome_term_scroll_to_bottom(term); [self scheduleRender]; return; }
-		key = ROME_KEY_END; break;
-	case NSPageUpFunctionKey:
-		if (mods & ROME_MOD_SHIFT) { rome_term_scroll_view(term, rows - 1); [self scheduleRender]; return; }
-		key = ROME_KEY_PAGEUP; break;
-	case NSPageDownFunctionKey:
-		if (mods & ROME_MOD_SHIFT) { rome_term_scroll_view(term, -(rows - 1)); [self scheduleRender]; return; }
-		key = ROME_KEY_PAGEDOWN; break;
-	case NSInsertFunctionKey: key = ROME_KEY_INS; break;
-	case NSDeleteFunctionKey: key = ROME_KEY_DEL; break;
-	case '\r': case 3: key = ROME_KEY_ENTER; break;
-	case '\t': case 0x19: key = ROME_KEY_TAB; break;
-	case 0x7f: case 8: key = ROME_KEY_BACKSPACE; break;
-	case 0x1b: key = ROME_KEY_ESCAPE; break;
+	case NSUpArrowFunctionKey: return ROME_KEY_UP;
+	case NSDownArrowFunctionKey: return ROME_KEY_DOWN;
+	case NSLeftArrowFunctionKey: return ROME_KEY_LEFT;
+	case NSRightArrowFunctionKey: return ROME_KEY_RIGHT;
+	case NSHomeFunctionKey: return ROME_KEY_HOME;
+	case NSEndFunctionKey: return ROME_KEY_END;
+	case NSPageUpFunctionKey: return ROME_KEY_PAGEUP;
+	case NSPageDownFunctionKey: return ROME_KEY_PAGEDOWN;
+	case NSInsertFunctionKey: return ROME_KEY_INS;
+	case NSDeleteFunctionKey: return ROME_KEY_DEL;
+	case '\r': case 3: return ROME_KEY_ENTER;
+	case '\t': case 0x19: return ROME_KEY_TAB;
+	case 0x7f: case 8: return ROME_KEY_BACKSPACE;
+	case 0x1b: return ROME_KEY_ESCAPE;
 	default:
-		if (c >= NSF1FunctionKey && c <= NSF35FunctionKey) {
-			key = ROME_KEY_F((int)(c - NSF1FunctionKey + 1));
-		}
-		break;
+		if (c >= NSF1FunctionKey && c <= NSF35FunctionKey)
+			return ROME_KEY_F((int)(c - NSF1FunctionKey + 1));
 	}
-	[self cursorActivity];
-	[NSCursor setHiddenUntilMouseMoves: YES];
-	if (rome_term_has_selection(term) && !(mods & ROME_MOD_SHIFT))
-		rome_term_select_clear(term);
-	if (key != ROME_KEY_NONE) {
-		if (c == 0x19)
-			mods |= ROME_MOD_SHIFT;
-		rome_term_key(term, key, mods);
-		[self scheduleRender];
-		return;
-	}
-	/* With Control or Meta the key's own character (Ctrl-C is 'c');
-	 * otherwise the composed text. */
+	return ROME_KEY_NONE;
+}
+
+/* The characters an event types (with Control or Meta the key's own character: Ctrl-C is 'c'),
+ * as code points, surrogate pairs joined, function-key private-use characters left out. */
+- (void) forEachCharacterOf: (NSEvent *)ev mods: (int)mods do: (void (^)(uint32_t))block
+{
+	NSString *chars = [ev characters], *raw = [ev charactersIgnoringModifiers];
 	NSString *s = (mods & (ROME_MOD_CTRL | ROME_MOD_ALT)) ? raw : chars;
 	NSUInteger n = [s length];
 	for (NSUInteger i = 0; i < n; i++) {
@@ -840,9 +817,62 @@ want_write_cb(void *owner)
 			continue;       /* a lone surrogate is not text */
 		if (u >= 0xf700 && u <= 0xf8ff)
 			continue;       /* other function keys */
-		rome_term_key_char(term, u, mods);
+		block(u);
 	}
+}
+
+- (void) keyDown: (NSEvent *)ev
+{
+	if (term == NULL || exited)
+		return;
+	unsigned flags = [ev modifierFlags];
+	if (flags & NSCommandKeyMask)
+		return;             /* menu key equivalents only */
+	NSString *chars = [ev characters], *raw = [ev charactersIgnoringModifiers];
+	int mods = [self keyMods: ev];
+	unichar c = [raw length] ? [raw characterAtIndex: 0] : ([chars length] ? [chars characterAtIndex: 0] : 0);
+	int key = special_key_for(c);
+	int rows = rome_term_rows(term);
+	int action = [ev isARepeat] ? ROME_KEY_REPEAT : ROME_KEY_PRESS;
+	if (mods & ROME_MOD_SHIFT) {        /* Shift with these scrolls the view instead */
+		if (key == ROME_KEY_HOME) { rome_term_scroll_view(term, 1 << 30); [self scheduleRender]; return; }
+		if (key == ROME_KEY_END) { rome_term_scroll_to_bottom(term); [self scheduleRender]; return; }
+		if (key == ROME_KEY_PAGEUP) { rome_term_scroll_view(term, rows - 1); [self scheduleRender]; return; }
+		if (key == ROME_KEY_PAGEDOWN) { rome_term_scroll_view(term, -(rows - 1)); [self scheduleRender]; return; }
+	}
+	[self cursorActivity];
+	[NSCursor setHiddenUntilMouseMoves: YES];
+	if (rome_term_has_selection(term) && !(mods & ROME_MOD_SHIFT))
+		rome_term_select_clear(term);
+	if (key != ROME_KEY_NONE) {
+		if (c == 0x19)
+			mods |= ROME_MOD_SHIFT;
+		rome_term_key_event(term, action, key, 0, mods);
+		[self scheduleRender];
+		return;
+	}
+	RomeTerm *t = term;
+	[self forEachCharacterOf: ev mods: mods do: ^(uint32_t u) { rome_term_key_event(t, action, ROME_KEY_NONE, u, mods); }];
 	[self scheduleRender];
+}
+
+/* Key releases matter only to programs that asked for them (the Kitty keyboard protocol). */
+- (void) keyUp: (NSEvent *)ev
+{
+	if (term == NULL || exited || ([ev modifierFlags] & NSCommandKeyMask))
+		return;
+	NSString *raw = [ev charactersIgnoringModifiers], *chars = [ev characters];
+	int mods = [self keyMods: ev];
+	unichar c = [raw length] ? [raw characterAtIndex: 0] : ([chars length] ? [chars characterAtIndex: 0] : 0);
+	int key = special_key_for(c);
+	if (key != ROME_KEY_NONE) {
+		if (c == 0x19)
+			mods |= ROME_MOD_SHIFT;
+		rome_term_key_event(term, ROME_KEY_RELEASE, key, 0, mods);
+		return;
+	}
+	RomeTerm *t = term;
+	[self forEachCharacterOf: ev mods: mods do: ^(uint32_t u) { rome_term_key_event(t, ROME_KEY_RELEASE, ROME_KEY_NONE, u, mods); }];
 }
 
 - (void) sendBenchKey: (unichar)c
@@ -1029,7 +1059,21 @@ want_write_cb(void *owner)
 	if (s == nil || term == NULL || exited)
 		return;
 	const char *u = [s UTF8String];
-	rome_term_paste(term, u, strlen(u));
+	size_t len = strlen(u);
+	/* A program that has not asked for bracketed pastes will take every line as typed, and run it:
+	 * ask first (RomePasteConfirm NO turns this off). */
+	if (default_bool(@"RomePasteConfirm", YES) && rome_term_paste_needs_confirm(term, u, len)) {
+		int lines = 1;
+		for (size_t i = 0; i < len; i++)
+			if (u[i] == '\n')
+				lines++;
+		int r = NSRunAlertPanel(@"Paste text with line breaks?",
+		    @"This program is not expecting a paste: each of the %d lines will be entered as if typed, and run.",
+		    @"Cancel", @"Paste", nil, lines);
+		if (r != NSAlertAlternateReturn)
+			return;
+	}
+	rome_term_paste(term, u, len);
 	[self cursorActivity];
 	[self scheduleRender];
 }

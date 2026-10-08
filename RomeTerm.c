@@ -648,7 +648,7 @@ ascii_key(uint32_t c, int *shifted, uint32_t *base)
 /* With the Kitty keyboard protocol on (or modifyOtherKeys), a character key is reported as a key
  * event, not as the raw bytes. Returns 1 if the encoder produced the bytes. */
 static int
-key_char_via_encoder(RomeTerm *t, uint32_t c, int mods)
+key_char_via_encoder(RomeTerm *t, uint32_t c, int mods, GhosttyKeyAction action)
 {
 	uint8_t flags = 0;
 	char out[64], text[8];
@@ -661,7 +661,7 @@ key_char_via_encoder(RomeTerm *t, uint32_t c, int mods)
 		return 0;
 	k = ascii_key(c, &shifted, &base);
 	ghostty_key_encoder_setopt_from_terminal(t->kenc, t->gt);
-	ghostty_key_event_set_action(t->kev, GHOSTTY_KEY_ACTION_PRESS);
+	ghostty_key_event_set_action(t->kev, action);
 	ghostty_key_event_set_key(t->kev, k);
 	ghostty_key_event_set_mods(t->kev, ghostty_mods(mods | (shifted ? ROME_MOD_SHIFT : 0)));
 	ghostty_key_event_set_consumed_mods(t->kev, shifted ? GHOSTTY_MODS_SHIFT : 0);
@@ -686,7 +686,7 @@ rome_term_key_char(RomeTerm *t, uint32_t c, int mods)
 	if ((c >= 0xd800 && c < 0xe000) || c > 0x10ffff)
 		return;         /* not a character */
 	rome_term_scroll_to_bottom(t);
-	if (key_char_via_encoder(t, c, mods))
+	if (key_char_via_encoder(t, c, mods, GHOSTTY_KEY_ACTION_PRESS))
 		return;
 	/* Control characters are sent as bytes (Ctrl-C is 0x03), with an ESC in
 	 * front for Alt. */
@@ -751,18 +751,19 @@ map_key(int key)
 	return GHOSTTY_KEY_UNIDENTIFIED;
 }
 
-void
-rome_term_key(RomeTerm *t, int key, int mods)
+static void
+key_special(RomeTerm *t, int key, int mods, GhosttyKeyAction action)
 {
 	char buf[64];
 	size_t n = 0;
 	GhosttyKey k = map_key(key);
 	if (k == GHOSTTY_KEY_UNIDENTIFIED)
 		return;
-	rome_term_scroll_to_bottom(t);
+	if (action != GHOSTTY_KEY_ACTION_RELEASE)
+		rome_term_scroll_to_bottom(t);
 	/* cursor-key mode, the Kitty flags and so on follow the terminal */
 	ghostty_key_encoder_setopt_from_terminal(t->kenc, t->gt);
-	ghostty_key_event_set_action(t->kev, GHOSTTY_KEY_ACTION_PRESS);
+	ghostty_key_event_set_action(t->kev, action);
 	ghostty_key_event_set_key(t->kev, k);
 	ghostty_key_event_set_mods(t->kev, ghostty_mods(mods));
 	ghostty_key_event_set_consumed_mods(t->kev, 0);
@@ -772,6 +773,41 @@ rome_term_key(RomeTerm *t, int key, int mods)
 		cb_output(buf, n, t);
 		send_output(t);
 	}
+}
+
+void
+rome_term_key(RomeTerm *t, int key, int mods)
+{
+	key_special(t, key, mods, GHOSTTY_KEY_ACTION_PRESS);
+}
+
+/* Press, repeat and release of a special key (`key`) or a character (`c`). Without the Kitty
+ * keyboard protocol asking for them, a release sends nothing and a repeat is a press. */
+void
+rome_term_key_event(RomeTerm *t, int action, int key, uint32_t c, int mods)
+{
+	GhosttyKeyAction a = action == ROME_KEY_RELEASE ? GHOSTTY_KEY_ACTION_RELEASE :
+	    action == ROME_KEY_REPEAT ? GHOSTTY_KEY_ACTION_REPEAT : GHOSTTY_KEY_ACTION_PRESS;
+	if (key != ROME_KEY_NONE) {
+		key_special(t, key, mods, a);
+		return;
+	}
+	if (c == 0 || (c >= 0xd800 && c < 0xe000) || c > 0x10ffff)
+		return;
+	if (a == GHOSTTY_KEY_ACTION_PRESS)
+		rome_term_key_char(t, c, mods);
+	else if (!key_char_via_encoder(t, c, mods, a) && a == GHOSTTY_KEY_ACTION_REPEAT)
+		rome_term_key_char(t, c, mods);
+}
+
+/* Would pasting this text run commands in a program that did not ask for a paste? (no bracketed
+ * paste mode, and the text has line breaks) */
+int
+rome_term_paste_needs_confirm(RomeTerm *t, const char *s, size_t len)
+{
+	if (len == 0 || mode_get(t, GHOSTTY_MODE_BRACKETED_PASTE))
+		return 0;
+	return !ghostty_paste_is_safe(s, len);
 }
 
 void
