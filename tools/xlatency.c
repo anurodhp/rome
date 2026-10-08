@@ -2,6 +2,7 @@
  * xlatency: drive and time a window from outside, through the X server, so any
  * terminal can be measured the same way.
  *
+ *   xlatency now                      monotonic milliseconds (to time shell commands)
  *   xlatency pids                     list top-level windows with their _NET_WM_PID
  *   xlatency type PID TEXT...         focus PID's window, type each TEXT then Return
  *   xlatency ctrld PID                send Control-D (end of input) to PID's window
@@ -161,7 +162,7 @@ static void type_string(const char *s)
 	for (; *s; s++) {
 		key((KeySym)(unsigned char)*s);     /* Latin-1 keysyms are the character codes */
 		XFlush(dpy);
-		usleep(8000);
+		usleep(15000);
 	}
 }
 
@@ -206,6 +207,10 @@ int main(int argc, char **argv)
 	}
 	a_pid = XInternAtom(dpy, "_NET_WM_PID", False);
 	Window root = DefaultRootWindow(dpy);
+	if (!strcmp(argv[1], "now")) {          /* monotonic ms, for timing shell commands */
+		printf("%.0f\n", now_ms());
+		return 0;
+	}
 	if (!strcmp(argv[1], "pids")) {
 		list_windows(root, 4);
 		return 0;
@@ -257,6 +262,20 @@ int main(int argc, char **argv)
 	unsigned int gw, gh, bw, depth;
 	XGetGeometry(dpy, w, &r, &gx, &gy, &gw, &gh, &bw, &depth);
 	int cw = gw < 420 ? (int)gw : 420, ch = gh < 26 ? (int)gh : 26;
+	if (getenv("XLAT_DEBUG")) {
+		Window ch_root, ch_parent, *kids = NULL;
+		unsigned int nk = 0;
+		fprintf(stderr, "window 0x%lx %ux%u at %d,%d; ", w, gw, gh, gx, gy);
+		if (XQueryTree(dpy, w, &ch_root, &ch_parent, &kids, &nk)) {
+			for (unsigned int i = 0; i < nk; i++) {
+				XWindowAttributes a;
+				XGetWindowAttributes(dpy, kids[i], &a);
+				fprintf(stderr, "child 0x%lx %dx%d at %d,%d map=%d; ", kids[i], a.width, a.height, a.x, a.y, a.map_state);
+			}
+			if (kids) XFree(kids);
+		}
+		fprintf(stderr, "\n");
+	}
 	if (!strcmp(argv[1], "floor")) {
 		enum { N = 300 };
 		double v[N];
