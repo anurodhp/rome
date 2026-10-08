@@ -60,6 +60,7 @@ typedef struct {
 	GLushort *idx;
 	CopySubFn copysub;
 	int sized;              /* the GL buffer has been validated at width x height */
+	Colormap cmap;
 } GLR;
 
 /* A quad of `rgb`. u, v is the atlas position of the glyph; a solid quad
@@ -311,8 +312,10 @@ gl_destroy(RomeRenderer *r)
 	if (g->win != 0) {
 		rome_x_unregister(g->win);
 		XDestroyWindow(g->dpy, g->win);
-		XSync(g->dpy, False);
 	}
+	if (g->cmap != 0)
+		XFreeColormap(g->dpy, g->cmap);
+	XSync(g->dpy, False);
 	free(g->bg.v);
 	free(g->fg.v);
 	free(g->idx);
@@ -342,7 +345,7 @@ rome_render_gl_new(RomeFont *font, unsigned long parent, int px, int py, int w, 
 	memset(&wa, 0, sizeof(wa));
 	wa.background_pixmap = None;
 	wa.border_pixel = 0;
-	wa.colormap = XCreateColormap(dpy, RootWindow(dpy, scr), vi->visual, AllocNone);
+	g->cmap = wa.colormap = XCreateColormap(dpy, RootWindow(dpy, scr), vi->visual, AllocNone);
 	wa.event_mask = ExposureMask;
 	wa.bit_gravity = NorthWestGravity;
 	g->win = XCreateWindow(dpy, (Window)parent, px, py, w > 0 ? w : 1, h > 0 ? h : 1, 0, vi->depth,

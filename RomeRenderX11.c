@@ -123,6 +123,7 @@ x11_resize(RomeRenderer *r, int w, int h)
 	if (x->img != NULL && w == r->width && h == r->height)
 		return 1;
 	image_free(x);
+	r->width = r->height = 0;   /* until the new image exists, everything clips away */
 	XResizeWindow(x->dpy, x->win, w, h);
 	XImage *img = image_shm(x, w, h);
 	if (img == NULL) {
@@ -259,6 +260,8 @@ x11_draw_row(RomeRenderer *r, int row, int x0, int x1, const RomeCell *cells)
 	X11R *x = (X11R *)r;
 	RomeFont *f = r->font;
 	double t0 = rome_now_ms();
+	if (x->pix == NULL)
+		return;             /* the last resize failed: nothing to draw into */
 	int py = r->pady + row * f->cell_h;
 	for (int i = x0; i < x1; i++) {
 		const RomeCell *c = &cells[i];
@@ -276,7 +279,7 @@ x11_scroll(RomeRenderer *r, int top, int bottom, int dy)
 	X11R *x = (X11R *)r;
 	RomeFont *f = r->font;
 	int sy = r->pady + top * f->cell_h, h = (bottom - top) * f->cell_h, dyp = dy * f->cell_h;
-	if (h <= 0 || sy + dyp < 0 || sy + h + dyp > r->height)
+	if (x->pix == NULL || h <= 0 || sy + dyp < 0 || sy + h + dyp > r->height)
 		return 0;
 	double t0 = rome_now_ms();
 	memmove(x->pix + (size_t)(sy + dyp) * x->stride, x->pix + (size_t)sy * x->stride,

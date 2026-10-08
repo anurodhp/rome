@@ -99,8 +99,6 @@ make ADDITIONAL_CPPFLAGS="-I/path/to/ghostty/include -I/usr/include/freetype2" \
 - Text shaping: combining marks (accents, Thai, Hebrew, Arabic and Indic vowel signs) are drawn over their letters, but Arabic letters are not joined, Devanagari conjuncts are not formed, right-to-left text is not reordered, and emoji sequences (ZWJ, skin tones, flags) show their first emoji only.
 - Emoji are monochrome outlines (the glyph atlas has one channel).
 - No image protocols (Sixel, Kitty graphics); the terminal ignores them.
-- Pasting without bracketed paste mode sends every line, as typing would.
-- Kitty keyboard protocol: key presses are reported, key releases are not.
 
 ## Licence
 

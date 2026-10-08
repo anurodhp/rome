@@ -37,6 +37,7 @@
 #endif
 
 struct RomeTerm {
+	int title_dirty;        /* an OSC title arrived during this feed; delivered once, after it */
 	GhosttyTerminal gt;
 	GhosttyRenderState rs;
 	GhosttyRenderStateRowIterator rit;
@@ -237,9 +238,16 @@ fx_bell(GhosttyTerminal gt, void *ud)
 static void
 fx_title(GhosttyTerminal gt, void *ud)
 {
-	RomeTerm *t = ud;
+	(void)gt;
+	((RomeTerm *)ud)->title_dirty = 1;
+}
+
+static void
+deliver_title(RomeTerm *t)
+{
 	GhosttyString s = { NULL, 0 };
-	if (t->cb.title == NULL || ghostty_terminal_get(gt, GHOSTTY_TERMINAL_DATA_TITLE, &s) != GHOSTTY_SUCCESS)
+	t->title_dirty = 0;
+	if (t->cb.title == NULL || ghostty_terminal_get(t->gt, GHOSTTY_TERMINAL_DATA_TITLE, &s) != GHOSTTY_SUCCESS)
 		return;
 	char *c = malloc(s.len + 1);
 	if (c == NULL)
@@ -555,6 +563,8 @@ void
 rome_term_feed(RomeTerm *t, const char *bytes, size_t len)
 {
 	ghostty_terminal_vt_write(t->gt, (const uint8_t *)bytes, len);
+	if (t->title_dirty)
+		deliver_title(t);
 	t->hint = 1;
 	send_output(t);
 }
