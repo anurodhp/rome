@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 NSString *RomeViewChildExitedNotification = @"RomeViewChildExitedNotification";
@@ -113,10 +115,21 @@ expose_cb(void *owner, int x, int y, int w, int h)
 static void
 title_cb(void *owner, const char *utf8)
 {
-	RomeView *v = owner;
-	NSString *s = [NSString stringWithUTF8String: utf8];
-	if (s != nil && [v window] != nil)
-		[[v window] setTitle: s];
+	[(RomeView *)owner performSelector: @selector(applicationSetTitle:)
+	    withObject: [NSString stringWithUTF8String: utf8]];
+}
+
+/* The command name of process `pid`, or nil. */
+static NSString *
+process_name(pid_t pid)
+{
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid };
+	struct kinfo_proc kp;
+	size_t len = sizeof(kp);
+	memset(&kp, 0, sizeof(kp));
+	if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len == 0 || kp.kp_proc.p_comm[0] == 0)
+		return nil;
+	return [NSString stringWithUTF8String: kp.kp_proc.p_comm];
 }
 
 static void
@@ -199,6 +212,9 @@ want_write_cb(void *owner)
 	[self shutdown];
 	[command release];
 	[rendererName release];
+	[oscTitle release];
+	[fgName release];
+	[shownTitle release];
 	[super dealloc];
 }
 
@@ -410,6 +426,8 @@ want_write_cb(void *owner)
 	[rl addEvent: (void *)(intptr_t)fd type: ET_RDESC watcher: self forMode: NSDefaultRunLoopMode];
 	[rl addEvent: (void *)(intptr_t)fd type: ET_RDESC watcher: self forMode: NSEventTrackingRunLoopMode];
 	reading = YES;
+	titleTimer = [[NSTimer scheduledTimerWithTimeInterval: 0.5 target: self selector: @selector(pollTitle:)
+	    userInfo: nil repeats: YES] retain];
 	if (blinkEnabled)
 		blinkTimer = [[NSTimer scheduledTimerWithTimeInterval: 0.53 target: self selector: @selector(blink:)
 		    userInfo: nil repeats: YES] retain];
@@ -434,6 +452,54 @@ want_write_cb(void *owner)
 {
 	rome_term_set_focus(term, [[self window] isKeyWindow]);
 	[self scheduleRender];
+}
+
+/* ---- window title ----
+ * What the application asked for (OSC 0/2) wins; until then, and once the
+ * foreground job that set it has gone, the name of the foreground process
+ * on the pty (bash, vim, htop). */
+
+- (void) showTitle: (NSString *)t
+{
+	if (t == nil || [t isEqualToString: shownTitle] || [self window] == nil)
+		return;
+	[shownTitle release];
+	shownTitle = [t retain];
+	[[self window] setTitle: t];
+}
+
+- (void) applicationSetTitle: (NSString *)t
+{
+	[oscTitle release];
+	oscTitle = nil;
+	if ([t length] > 0) {
+		oscTitle = [t retain];
+		oscPgrp = term != NULL && rome_term_fd(term) >= 0 ? tcgetpgrp(rome_term_fd(term)) : 0;
+		[self showTitle: t];
+	} else {
+		[self pollTitle: nil];
+	}
+}
+
+- (void) pollTitle: (NSTimer *)timer
+{
+	if (term == NULL || rome_term_fd(term) < 0)
+		return;
+	pid_t pg = tcgetpgrp(rome_term_fd(term));
+	if (pg <= 0)
+		return;
+	if (oscTitle != nil && pg != oscPgrp) {
+		[oscTitle release];
+		oscTitle = nil;
+	}
+	if (oscTitle != nil)
+		return;
+	if (pg != fgPgrp || fgName == nil) {
+		fgPgrp = pg;
+		[fgName release];
+		fgName = [process_name(pg) retain];
+	}
+	[self showTitle: fgName];
 }
 
 - (void) windowResized: (NSNotification *)n
@@ -466,6 +532,9 @@ want_write_cb(void *owner)
 	[blinkTimer invalidate];
 	[blinkTimer release];
 	blinkTimer = nil;
+	[titleTimer invalidate];
+	[titleTimer release];
+	titleTimer = nil;
 	if (term != NULL)
 		[self stopReading];
 	/* destroy the child X window before GNUstep destroys its parent */

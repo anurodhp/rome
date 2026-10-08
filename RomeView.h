@@ -21,7 +21,9 @@
 	int pad;
 	double minFrameMs, lastRenderMs;
 	BOOL renderScheduled, reading, writing, exited, optionAsMeta, blinkEnabled;
-	NSTimer *blinkTimer;
+	NSTimer *blinkTimer, *titleTimer;
+	NSString *oscTitle, *fgName, *shownTitle;
+	pid_t oscPgrp, fgPgrp;
 	int selRow, selCol, selClicks;
 	BOOL selecting, mouseReporting;
 	/* stats (ROME_STATS) */
