@@ -5,6 +5,7 @@
 #import <GNUstepGUI/GSDisplayServer.h>
 #include "RomeX.h"
 #include <errno.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,6 +181,7 @@ want_write_cb(void *owner)
 	minFrameMs = fps > 0 ? 1000.0 / fps : 0;
 	optionAsMeta = default_bool(@"RomeOptionAsMeta", YES);
 	blinkEnabled = default_bool(@"RomeCursorBlink", YES);
+	immediateRender = default_bool(@"RomeImmediateRender", YES);
 	rendererName = [default_string(@"RomeRenderer", @"x11") retain];
 	const RomeTheme *theme = theme_named(default_string(@"RomeTheme", @"Dark"));
 	themeBg = theme->bg;
@@ -612,11 +614,17 @@ want_write_cb(void *owner)
 	long n = rome_term_read(term, 256 * 1024);
 	if (n > 0) {
 		bytesRead += n;
-		if (n <= 4096 && renderer != NULL) {
-			/* Interactive output (an echo, a prompt): draw it now. Waiting out
-			 * the frame cap means waiting on a timer, and a timer can fire up
-			 * to a hundred milliseconds late (the kernel coalesces the timers
-			 * of background-class processes). Only a flood is paced by the cap. */
+		/* Recent output volume, halving every 100 ms: a flood arrives in small
+		 * pty-sized reads, typing and prompts barely register. */
+		double now = rome_now_ms();
+		recentBytes = recentBytes * exp2(-(now - recentAt) / 100.0) + n;
+		recentAt = now;
+		if (immediateRender && renderer != NULL && recentBytes <= 4096) {
+			/* Interactive output (an echo, a prompt): draw it now rather than
+			 * waiting on the frame timer, which can fire up to a hundred
+			 * milliseconds late for a background-class process. A flood keeps
+			 * the frame cap, since each small read would otherwise cost a
+			 * frame. */
 			if (renderScheduled) {
 				[NSObject cancelPreviousPerformRequestsWithTarget: self selector: @selector(renderNow) object: nil];
 				renderScheduled = NO;

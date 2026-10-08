@@ -22,9 +22,9 @@
 	BOOL tabHidden;
 	int pad;
 	double minFrameMs, lastRenderMs;
-	BOOL renderScheduled, reading, writing, exited, optionAsMeta, blinkEnabled;
+	BOOL immediateRender, renderScheduled, reading, writing, exited, optionAsMeta, blinkEnabled;
 	NSTimer *blinkTimer, *titleTimer, *probeTimer;
-	double probeLast;
+	double probeLast, recentBytes, recentAt;
 	NSString *oscTitle, *fgName, *shownTitle;
 	pid_t oscPgrp, fgPgrp;
 	int selClicks;
