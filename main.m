@@ -10,7 +10,7 @@
  *   RomeMaxFPS        frame cap (60)
  *   RomeCursorBlink   YES
  *   RomeOptionAsMeta  YES (Option/Alt sends ESC-prefixed keys)
- *   RomeTheme         Basic (black on white) or Pro (light on black)
+ *   RomeTheme         Dark (white on black; the default), Pro or Basic (black on white)
  *   RomeCommand       run "/bin/sh -c <command>" instead of the login shell
  *   RomeQuitOnExit    quit when the command exits (benchmarks)
  *   RomeBenchType     type N characters into the pty, 20 a second, then ^D

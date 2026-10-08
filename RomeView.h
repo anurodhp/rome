@@ -13,6 +13,11 @@
 	RomeFont *font;
 	NSString *rendererName;
 	NSArray *command;
+	NSScroller *scroller;
+	int scSb, scOff, scRows;
+	NSSize laidOut;
+	NSPoint laidOrigin;
+	uint32_t themeBg;
 	int pad;
 	double minFrameMs, lastRenderMs;
 	BOOL renderScheduled, reading, writing, exited, optionAsMeta, blinkEnabled;

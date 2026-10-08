@@ -28,7 +28,24 @@ static const RomeTheme theme_pro = {
 	             0x666666, 0xe50000, 0x00d900, 0xe5e500, 0x0000ff, 0xe500e5, 0x00e5e5, 0xe5e5e5 },
 };
 
+/* the default: white on black, Pro's ANSI colours */
+static const RomeTheme theme_dark = {
+	.fg = 0xffffff, .bg = 0x000000, .cursor = 0x4d4d4d, .selection = 0x414f78,
+	.palette = { 0x000000, 0xcc3333, 0x00a600, 0x999900, 0x4a6bff, 0xb200b2, 0x00a6b2, 0xbfbfbf,
+	             0x666666, 0xe50000, 0x00d900, 0xe5e500, 0x6b8cff, 0xe500e5, 0x00e5e5, 0xffffff },
+};
+
 static BOOL g_stats;
+
+static const RomeTheme *
+theme_named(NSString *name)
+{
+	if ([name caseInsensitiveCompare: @"Basic"] == NSOrderedSame)
+		return &theme_basic;
+	if ([name caseInsensitiveCompare: @"Pro"] == NSOrderedSame)
+		return &theme_pro;
+	return &theme_dark;
+}
 
 static NSString *
 default_string(NSString *key, NSString *def)
@@ -128,9 +145,10 @@ want_write_cb(void *owner)
 	if (f == NULL)
 		f = open_font();
 	int pad = (int)default_double(@"RomePadding", 4);
+	CGFloat sw = [NSScroller scrollerWidth];
 	if (f == NULL)
-		return NSMakeSize(cols * 8 + 2 * pad, rows * 16 + 2 * pad);
-	return NSMakeSize(cols * f->cell_w + 2 * pad, rows * f->cell_h + 2 * pad);
+		return NSMakeSize(cols * 8 + 2 * pad + sw, rows * 16 + 2 * pad);
+	return NSMakeSize(cols * f->cell_w + 2 * pad + sw, rows * f->cell_h + 2 * pad);
 }
 
 - (id) initWithFrame: (NSRect)frame command: (NSArray *)argv
@@ -151,11 +169,11 @@ want_write_cb(void *owner)
 	optionAsMeta = default_bool(@"RomeOptionAsMeta", YES);
 	blinkEnabled = default_bool(@"RomeCursorBlink", YES);
 	rendererName = [default_string(@"RomeRenderer", @"x11") retain];
-	NSString *th = default_string(@"RomeTheme", @"Basic");
-	const RomeTheme *theme = [th caseInsensitiveCompare: @"Pro"] == NSOrderedSame ? &theme_pro : &theme_basic;
+	const RomeTheme *theme = theme_named(default_string(@"RomeTheme", @"Dark"));
+	themeBg = theme->bg;
 
 	RomeTermCallbacks cb = { title_cb, bell_cb, want_write_cb };
-	int cols = ((int)frame.size.width - 2 * pad) / font->cell_w;
+	int cols = ((int)frame.size.width - (int)[NSScroller scrollerWidth] - 2 * pad) / font->cell_w;
 	int rows = ((int)frame.size.height - 2 * pad) / font->cell_h;
 	term = rome_term_new(rows, cols, (int)default_double(@"RomeScrollback", 5000), theme, &cb, self);
 	if (term == NULL) {
@@ -163,6 +181,15 @@ want_write_cb(void *owner)
 		return nil;
 	}
 	[self setAutoresizingMask: NSViewWidthSizable | NSViewHeightSizable];
+	/* The X child window covers the grid only; the scroller sits beside it
+	 * in the strip it leaves, where AppKit still draws and gets the mouse. */
+	scroller = [[NSScroller alloc] initWithFrame: NSMakeRect(0, 0, [NSScroller scrollerWidth], frame.size.height)];
+	[scroller setArrowsPosition: NSScrollerArrowsNone];
+	[scroller setTarget: self];
+	[scroller setAction: @selector(scrollerHit:)];
+	[scroller setEnabled: NO];
+	[self addSubview: scroller];
+	[scroller release];
 	startMs = rome_now_ms();
 	return self;
 }
@@ -185,7 +212,8 @@ want_write_cb(void *owner)
 - (void) drawRect: (NSRect)r
 {
 	/* covered by the child window; shows only while it is being created */
-	[[NSColor windowBackgroundColor] set];
+	[[NSColor colorWithCalibratedRed: ((themeBg >> 16) & 255) / 255.0 green: ((themeBg >> 8) & 255) / 255.0
+	    blue: (themeBg & 255) / 255.0 alpha: 1] set];
 	NSRectFill(r);
 }
 
@@ -212,6 +240,16 @@ want_write_cb(void *owner)
 	return NSMakePoint(NSMinX(rect), height - NSMaxY(rect));
 }
 
+/* The part of the view the X child covers: all of it but the scroller strip. */
+- (NSSize) gridSize
+{
+	NSSize s = [self bounds].size;
+	s.width -= [NSScroller scrollerWidth];
+	if (s.width < 1)
+		s.width = 1;
+	return s;
+}
+
 - (void) createRenderer
 {
 	NSWindow *w = [self window];
@@ -231,7 +269,7 @@ want_write_cb(void *owner)
 			XSync(gdpy, False);
 	}
 	NSPoint o = [self xOrigin];
-	NSSize s = [self bounds].size;
+	NSSize s = [self gridSize];
 	BOOL wantGL = [rendererName caseInsensitiveCompare: @"gl"] == NSOrderedSame;
 	if (wantGL)
 		renderer = rome_render_gl_new(font, parent, (int)o.x, (int)o.y, (int)s.width, (int)s.height);
@@ -258,22 +296,77 @@ want_write_cb(void *owner)
 
 - (void) updatePadColor
 {
-	NSString *th = default_string(@"RomeTheme", @"Basic");
-	renderer->padbg = [th caseInsensitiveCompare: @"Pro"] == NSOrderedSame ? theme_pro.bg : theme_basic.bg;
+	renderer->padbg = themeBg;
 }
 
 - (void) layoutGrid
 {
+	NSSize b = [self bounds].size;
+	CGFloat sw = [NSScroller scrollerWidth];
+	[scroller setFrame: NSMakeRect(b.width - sw, 0, sw, b.height)];
 	if (renderer == NULL)
 		return;
-	NSSize s = [self bounds].size;
+	NSSize s = [self gridSize];
 	NSPoint o = [self xOrigin];
+	if (s.width == laidOut.width && s.height == laidOut.height && o.x == laidOrigin.x && o.y == laidOrigin.y)
+		return;
+	laidOut = s;
+	laidOrigin = o;
 	rome_render_move(renderer, (int)o.x, (int)o.y);
 	renderer->resize(renderer, (int)s.width, (int)s.height);
 	int cols = ((int)s.width - 2 * pad) / font->cell_w;
 	int rows = ((int)s.height - 2 * pad) / font->cell_h;
+	if (g_stats)
+		fprintf(stderr, "rome: layout %dx%d px -> %dx%d cells\n", (int)s.width, (int)s.height, cols, rows);
 	rome_term_resize(term, rows, cols, cols * font->cell_w, rows * font->cell_h);
 	rome_term_damage_all(term);
+	[self scheduleRender];
+}
+
+/* ---- scroll bar ---- */
+
+- (void) updateScroller
+{
+	if (term == NULL)
+		return;
+	int sb = rome_term_scrollback_lines(term), off = rome_term_view_offset(term), rows = rome_term_rows(term);
+	if (sb == scSb && off == scOff && rows == scRows)
+		return;
+	scSb = sb;
+	scOff = off;
+	scRows = rows;
+	if (sb <= 0 || rome_term_altscreen(term)) {
+		[scroller setEnabled: NO];
+		[scroller setFloatValue: 1 knobProportion: 1];
+		return;
+	}
+	[scroller setEnabled: YES];
+	[scroller setFloatValue: 1.0 - (double)off / sb knobProportion: (double)rows / (sb + rows)];
+}
+
+- (void) scrollerHit: (id)sender
+{
+	if (term == NULL)
+		return;
+	int sb = rome_term_scrollback_lines(term), off = rome_term_view_offset(term), rows = rome_term_rows(term);
+	switch ([scroller hitPart]) {
+	case NSScrollerKnob:
+	case NSScrollerKnobSlot: {
+		int target = (int)((1.0 - [scroller floatValue]) * sb + 0.5);
+		rome_term_scroll_view(term, target - off);
+		break;
+	}
+	case NSScrollerDecrementPage:
+		rome_term_scroll_view(term, rows - 1);
+		break;
+	case NSScrollerIncrementPage:
+		rome_term_scroll_view(term, -(rows - 1));
+		break;
+	default:
+		return;
+	}
+	scSb = -1;      /* the knob may have to snap to a whole line */
+	[self updateScroller];
 	[self scheduleRender];
 }
 
@@ -286,6 +379,7 @@ want_write_cb(void *owner)
 	NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
 	[nc addObserver: self selector: @selector(windowFocus:) name: NSWindowDidBecomeKeyNotification object: w];
 	[nc addObserver: self selector: @selector(windowFocus:) name: NSWindowDidResignKeyNotification object: w];
+	[nc addObserver: self selector: @selector(windowResized:) name: NSWindowDidResizeNotification object: w];
 	[nc addObserver: self selector: @selector(windowWillClose:) name: NSWindowWillCloseNotification object: w];
 }
 
@@ -340,6 +434,11 @@ want_write_cb(void *owner)
 {
 	rome_term_set_focus(term, [[self window] isKeyWindow]);
 	[self scheduleRender];
+}
+
+- (void) windowResized: (NSNotification *)n
+{
+	[self layoutGrid];
 }
 
 - (void) windowWillClose: (NSNotification *)n
@@ -475,6 +574,7 @@ want_write_cb(void *owner)
 		if (g_stats && frames % 200 == 0)
 			[self printStats];
 	}
+	[self updateScroller];
 	/* XSync in the frame may have queued events (exposes) */
 	rome_x_pump();
 }
